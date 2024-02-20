@@ -1,13 +1,17 @@
-# This is strickyak's spoonfeed demo modified for the CoPiCo
+# This is strickyak's spoonfeed demo, modified for the REV 0.1 CoPiCo board.
+#
+# Copyright (c) 2024 Henry Strickland (strickyak) & Thomas Shanks
+# Licence: MIT License
 
 import time
 
-import machine, rp2
+import machine
+import rp2
 
 FIRST_DATA_PIN = 0
 NUM_DATA_PINS = 8
 FIRST_ADDRESS_PIN = 8
-NUM_ADDRESS_PINS = 10 # Actually 9 since we're reallocating GPIO 17 to triggering the oscilloscope
+NUM_ADDRESS_PINS = 10
 READ_NOT_WRITE_PIN = 18
 RESETN_PIN = 19
 NETIO_SEL_N_PIN = 20
@@ -21,7 +25,6 @@ Led = machine.Pin("LED", machine.Pin.OUT)
 Halt = machine.Pin(HALT_PIN, machine.Pin.OUT)
 Slenb = machine.Pin(SLENB_PIN, machine.Pin.OUT)
 Dir = machine.Pin(DRIVE_DATA_BUS_PIN, machine.Pin.OUT)
-Trigger = machine.Pin(17, machine.Pin.OUT) # Make sure to remove JP2 and connect oscilloscope to center machine.Pin
 ResetN = machine.Pin(RESETN_PIN, machine.Pin.IN)
 EClock = machine.Pin(E_CLOCK_PIN, machine.Pin.IN)
 
@@ -29,12 +32,11 @@ Led.value(1)
 Halt.value(0)
 Slenb.value(0)
 Dir.value(1)
-Trigger.value(0)
 
 OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 @rp2.asm_pio(
-    out_init=tuple(8 * [IN_HIGH]),   # 0-7: D0-D7
-    sideset_init=(OUT_HIGH, OUT_LOW, OUT_HIGH, OUT_LOW),  # 13:Halt 14:Slenb 15:dir 16:trigger
+    out_init=tuple(8 * [IN_HIGH]), # 0-7: D0-D7
+    sideset_init=(OUT_HIGH, OUT_HIGH, OUT_LOW), # Dir, Halt, slenb
     out_shiftdir=rp2.PIO.SHIFT_RIGHT, # 8 bits at a time
     autopull=True,
     pull_thresh=32,
@@ -50,7 +52,7 @@ def onreset_prog():
     # between the Coco Data Bus (D0-D7) and the Pico's GPIO0-GPIO7.
     # Out means out to the coco.  In means in from the Coco.
     # The default is IN, unless we really mean to be writing to the Coco.
-    set(x, 3)                   .side(0b100) # 3 means loop 4x # direction=1=IN Slenb=no Halt=no # Unhalts the M6809
+    set(x, 3)                   .side(0b001) # x=3 means loop 4x; Slenb=no, Halt=no, direction=1=IN; Unhalts the M6809
     
     # Count four dead cycles (includes the one in which we unhalted).
     label("four_times")
@@ -59,22 +61,22 @@ def onreset_prog():
     jmp(x_dec, "four_times")
     
     # Output the HIGH then the LOW byte of the reset vector we want.
-    out(pindirs, 8)             .side(0b010) # direction=0=OUT Slenb=yes Halt=no
-    out(pins, 8)                   # output HIGH byte of Reset Vector (8 bits from OSR)
+    out(pindirs, 8)             .side(0b100) # Slenb=yes, Halt=no, direction=0=OUT
+    out(pins, 8)               # output HIGH byte of Reset Vector (8 bits from OSR)
     wait(1, gpio, E_CLOCK_PIN) # wait until E hi
     wait(0, gpio, E_CLOCK_PIN) # wait until E lo
-    out(pins, 8)                   # output LOW byte of Reset Vector (8 bits from OSR)
-    wait(1, gpio, E_CLOCK_PIN)  .side(0b011) # wait until E hi, Halt=yes (to halt before first instruction)
+    out(pins, 8)               # output LOW byte of Reset Vector (8 bits from OSR)
+    wait(1, gpio, E_CLOCK_PIN)  .side(0b110) # wait until E hi; in the mean time, set Halt=yes (to halt before first instruction)
     wait(0, gpio, E_CLOCK_PIN) # wait until E lo
-    out(pindirs, 8)             .side(0b101) # direction=1=IN, Slenb=no, Halt=yes
+    out(pindirs, 8)             .side(0b011) # Slenb=no, Halt=yes, direction=1=IN
 
     # Get stuck here until the main routine re-inits this state machine.
     label("loop_forever")
     jmp("loop_forever")
     
 @rp2.asm_pio(
-    out_init=tuple(8 * [IN_HIGH]),   # 0-7: D0-D7
-    sideset_init=(OUT_HIGH, OUT_LOW, OUT_HIGH, OUT_LOW),  # 13:Halt 14:Slenb 15:dir 16:trigger
+    out_init=tuple(8 * [IN_HIGH]), # 0-7: D0-D7
+    sideset_init=(OUT_HIGH, OUT_HIGH, OUT_LOW), # Dir, Halt, slenb
     out_shiftdir=rp2.PIO.SHIFT_RIGHT, # 8 bits at a time
     autopull=True,
     pull_thresh=32,
@@ -92,49 +94,49 @@ def ldd_immediate_std_extended_prog():
     wait(0, gpio, E_CLOCK_PIN) # wait until E lo
 
     # Three dead cycles.  We release halt during these.
-    set(x, 2)              # Loop three times, so count down with X=2.
+    set(x, 2)                  # Loop three times, so count down with X=2.
     label("three_times")
-    wait(1, gpio, E_CLOCK_PIN)  .side(0b0100) # wait until E hi # trigger=0 direction=1=IN Slenb=no Halt=no # Unhalts the M6809
+    wait(1, gpio, E_CLOCK_PIN)  .side(0b001) # wait until E hi; Slenb=no, Halt=no, direction=1=IN; Unhalts the M6809
     wait(0, gpio, E_CLOCK_PIN) # wait until E lo
     jmp(x_dec, "three_times")
 
-    set(x, 5)         # Loop six times, so count down with X=5.
-    out(pindirs, 8)             .side(0b0010) # trigger=0 direction=0=OUT Slenb=yes Halt=no
+    set(x, 5)                  # Loop six times, so count down with X=5.
+    out(pindirs, 8)             .side(0b100) # Slenb=yes, Halt=no, direction=0=OUT
     label("six_times")
-    out(pins, 8)                   # output HIGH byte of Reset Vector (8 bits from OSR)
-    wait(1, gpio, E_CLOCK_PIN)  .side(0b0010) # wait until E hi
-    wait(0, gpio, E_CLOCK_PIN)  .side(0b1010) # wait until E lo
+    out(pins, 8)               # output HIGH byte of Reset Vector (8 bits from OSR)
+    wait(1, gpio, E_CLOCK_PIN)  .side(0b100) # wait until E hi
+    wait(0, gpio, E_CLOCK_PIN)  .side(0b100) # wait until E lo
     jmp(x_dec, "six_times")
 
     # Three more cycles will execute, but we don't have to wait for them.
     # The CPU will halt after those cycles, at the end of the instruction.
-    out(pindirs, 8)   .side(0b0101) # trigger=0 direction=1=IN Slenb=no Halt=yes
+    out(pindirs, 8)             .side(0b011) # Slenb=no, Halt=yes, direction=1=IN
 
     # Get stuck here until the main routine re-inits this state machine.
     label("loop_forever")
     jmp("loop_forever")
 
 print("Step2: waiting for RESET.  ")
-while ResetN.value()==1: pass  # wait for drop
+while ResetN.value()==1: pass # wait for drop
 print("got RESET.  ")
 Led.value(0)
-Halt.value(1)                  # halt while resetting
-time.sleep(0.1)                     # debounce
+Halt.value(1)                 # halt while resetting
+time.sleep(0.1)               # debounce
 print("debounced.  ")
-while ResetN.value()==0: pass  # wait for ResetN to release
+while ResetN.value()==0: pass # wait for ResetN to release
 print("RESET gone.  ")
-time.sleep(0.5)                     # debounce and wait to sync on Halt
+time.sleep(0.5)               # debounce and wait to sync on Halt
 print("SLEPT half a second.  ")
 
 pio0 = rp2.PIO(0)
 pio0.add_program(onreset_prog)
 
 sm1 = pio0.state_machine(
-    1,  # which state machine in pio0
+    1, # which state machine in pio0
     onreset_prog,
     freq=125_000_000,
-    sideset_base=Halt,
-    out_base=0,
+    sideset_base=DRIVE_DATA_BUS_PIN,
+    out_base=FIRST_DATA_PIN,
 )
 # FF=outputs A027=reset_vector 00=inputs
 sm1.put(0x0027a0ff)
@@ -162,8 +164,8 @@ for (w1, w2, b1, b2) in PairsOfWords:
   sm2 = pio0.state_machine(2) # which state machine in pio
   sm2.init(ldd_immediate_std_extended_prog,
     freq=125_000_000,
-    sideset_base=Halt,
-    out_base=0,
+    sideset_base=DRIVE_DATA_BUS_PIN,
+    out_base=FIRST_DATA_PIN,
   )
   # sm2.put(0x5958CCff)  # ff=outputs CC=LDD_immediate $58='X' $59='Y'
   # sm2.put(0x000000FD)  # FD=STD_extended 00=inputs
