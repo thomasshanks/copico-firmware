@@ -6,11 +6,6 @@ microcontroller dev board, which includes onboard WiFi.
 
 ![copico_pcb_rev0 1_front](https://github.com/thomasshanks/copico-board/assets/12594889/59d96e60-4434-4ec9-bde2-a83d828fd465)
 
-![copico_pcb_rev0 1_back](https://github.com/thomasshanks/copico-board/assets/12594889/e07aa954-f644-40c8-9ac1-5fedec6be4f7)
-
-![copico_rev0 1_schematic](https://github.com/thomasshanks/copico-board/assets/12594889/dc186fd7-bd3a-4350-a1a7-f4d89a8e7ffe)
-[copico_rev0.1_schematic_v0.1.9.pdf](https://github.com/thomasshanks/copico-board/files/14322771/copico_rev0.1_schematic_v0.1.9.pdf)
-
 This proof-of-concept "firmware" runs in MicroPython on the CoPiCo. It connects
 to a predetermined TCP port and streams the next byte to the Tandy Color
 Computer whenever any address in the range 0xFF68-0xFF6B or 0xFF78-0xFF7B is
@@ -46,5 +41,4 @@ continues!
 Thank you for being a part of the Retrocomputing community!
 
 
-Thomas Shanks (copico@tshanks.org)
-13 Feb 2024
+Thomas Shanks (copico@tshanks.org), 13 Feb 2024
