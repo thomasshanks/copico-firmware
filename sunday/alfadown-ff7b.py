@@ -34,7 +34,7 @@ OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 
 FIRST_DATA_PIN = 0
 DATA_BUS_WIDTH = 8
-FIRST_SIDESET_PIN = 13 # AardHalt
+FIRST_SIDESET_PIN = AardHalt
 
 Led = machine.Pin("LED", machine.Pin.OUT, value=0)
 
@@ -46,9 +46,10 @@ def on_control_write():
     SM_IRQ = 4         # for State Machine communictaion
 
     wrap_target()
+    wait(0, gpio, AARD_WRITE_C)
     wait(1, gpio, AARD_WRITE_C)
     irq(clear, SM_IRQ)
-    wait(0, gpio, AARD_WRITE_C)
+    #irq(0)
     wrap()
 
 @rp2.asm_pio(
@@ -63,22 +64,44 @@ def on_data_read():
 
     # Wait for a singal from the control port.
     wrap_target()
+    
     irq(block, SM_IRQ)
     set(y, 26)      # Letter 'Z' in VDG Text Mode
 
+
     # Wait for Data Port read.
     label("wait_data_port_read")
-    wait(1, gpio, AARD_READ_D)                                                                     # type: ignore
+    wait(0, gpio, AARD_READ_D)
+    wait(1, gpio, AARD_READ_D)
 
-    set(x, 0)
-    set(x, ~x) # , op=invert)      # set x := 255 (meaning OUTPUT to data bus)
-    mov(pindirs, x)   .side(0b1000) # trigger=1 direction=0=OUT Slenb=no Halt=no
-    mov(pins, y)
+    #jmp("wait_data_port_read")
+    #label("loop")
+    #jmp("loop")
+    #wrap()
+
+    #mov(pindirs, invert(null))   .side(0b0000) # trigger=1 direction=0=OUT Slenb=no Halt=no
+    #set(x, 31)
+    #mov(pindirs, x)   .side(0b1000) # trigger=1 direction=0=OUT Slenb=no Halt=no
+
+    set(pindirs, 31)
+    mov(pins, y).side(0b0000)
+    # NANDO # adding this line makes the coco3 crazy --> # wait(0, gpio, AARD_READ_D)
+    mov(pins, y).side(0b0100)
     
-    wait(0, gpio, AARD_READ_D) # wait until strobe falls  # type: ignore
-    set(x, 0)
-    mov(pindirs, x)   .side(0b0100) # trigger=0 direction=1=IN Slenb=no Halt=no
+    #wait(0, gpio, AARD_READ_D) # wait until strobe falls  # type: ignore
+    #mov(pindirs, null)   .side(0b0100) # trigger=0 direction=1=IN Slenb=no Halt=no
+    set(x, 0)     # or, mov(pindirs, null) ?
+    
+    # NANDO NANDO NANDO -- if I uncomment the next line, it kills the coco3.
+    # Why?  this changes the pindirs on THIS side of the LVC buffer.
+    # and 0 should be making them inputs.
+    #mov(pindirs, x)   .side(0b0100) # trigger=0 direction=1=IN Slenb=no Halt=no
+    # NANDO or how about set() instead?
+    set(pindirs, 0)
 
+
+    irq(0)
+    
     # After y reaches 0 ('@' on VDG Text Screen), don't respond to Data Read strobes.
     jmp(y_dec, "wait_data_port_read")
     # until we get the signal on the Control Port.
@@ -102,11 +125,16 @@ sm_data_read = pio0.state_machine(
     out_base=FIRST_DATA_PIN,
     sideset_base=FIRST_SIDESET_PIN,
 )
-#sm_data_read.active(True)
+sm_data_read.active(True)
+
+def handler(pio):
+    print('handler')
+pio0.irq(handler)
+
 
 # Blink LED at 1 Hz
 while True:
-	AardLED.value(1)
-	time.sleep(0.5)
-	AardLED.value(0)
-	time.sleep(0.5)
+    AardLED.value(1)
+    time.sleep(0.2)
+    AardLED.value(0)
+    time.sleep(0.8)
