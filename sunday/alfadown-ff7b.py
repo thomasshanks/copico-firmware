@@ -4,41 +4,42 @@
 # If output is allowed, reads from the Data Port at $FF7B will get 26, then 25, then 24... to 0.
 # When it reaches 0, output is no longer allowed, until the next write to Control Port.
 
+# Copyright (c) 2024 Phoenix Brown under MIT License
+# Copyright (c) 2024 Henry Strickland (GitHub: strickyak) under the MIT License
 # Copyright (c) 2024 Thomas Shanks; released under the standard MIT License
-# Portions Copyright (c) 2024 Henry Strickland (GitHub: strickyak), included under the MIT License
 
 import time
 
 import machine
 import rp2
-
-from machine import Pin
-
-
-AardLED = Pin("LED", Pin.OUT)
-
-AardHalt = Pin(13, Pin.OUT)
-AardSlenb = Pin(14, Pin.OUT)
-AardDir = Pin(15, Pin.OUT)
-
-AardWriteC = Pin(10, Pin.IN)
-AardWriteD = Pin(11, Pin.IN)
-AardReadD = Pin(12, Pin.IN)
-
-AardLED.value(0)
-AardHalt.value(0)
-AardSlenb.value(0)
-AardDir.value(1)  # 1 = IN to PicoW
+import _thread
 
 OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 
+AardLED = machine.Pin("LED", machine.Pin.OUT)
+
+AardWriteC = machine.Pin(10, machine.Pin.IN) # 0 = Write Control Port
+AardWriteD = machine.Pin(11, machine.Pin.IN) # 0 = Write Data Port
+AardReadD = machine.Pin(12, machine.Pin.IN)  # 0 = Read Data Port
+
+AardHalt = machine.Pin(13, machine.Pin.OUT)  # 1 = Halt CoCo
+AardSlenb = machine.Pin(14, machine.Pin.OUT) # 1 = Assert SLENB to CoCo
+AardDir = machine.Pin(15, machine.Pin.OUT)   # 1 = IN to PicoW from CoCo
+AardTrigger = machine.Pin(16, machine.Pin.OUT) # Debug output for triggering oscilloscope capture
+
+AardLED.value(0)   # LED off
+AardHalt.value(0)  # 0 = Don't HALT; run CoCo
+AardSlenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
+AardDir.value(1)   # 1 = IN to PicoW from CoCo
+
 FIRST_DATA_PIN = 0
 DATA_BUS_WIDTH = 8
-FIRST_SIDESET_PIN = AardHalt
+FIRST_SIDESET_PIN = AardDir
 
 Led = machine.Pin("LED", machine.Pin.OUT, value=0)
 
 @rp2.asm_pio(
+    in_shiftdir=rp2.PIO.SHIFT_LEFT, # Shift bits into the most significant end of the shift register
 )
 def on_control_write():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
@@ -46,65 +47,55 @@ def on_control_write():
     SM_IRQ = 4         # for State Machine communictaion
 
     wrap_target()
-    wait(0, gpio, AARD_WRITE_C)
-    wait(1, gpio, AARD_WRITE_C)
-    irq(clear, SM_IRQ)
-    #irq(0)
+
+    wait(1, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is not being asserted (to prevent false positives)
+    wait(0, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is being asserted
+
+    irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes
+
     wrap()
 
 @rp2.asm_pio(
-    out_init=tuple(8 * [IN_HIGH]),    # 0-7: D0-D7
-    sideset_init=(OUT_LOW, OUT_LOW, OUT_HIGH, OUT_LOW),  # 13:Halt 14:Slenb 15:dir 16:trigger
-    out_shiftdir=rp2.PIO.SHIFT_RIGHT, # We will shift out 8 bits at a time
+    out_init=tuple(8 * [IN_HIGH]),    # Data bus pins will default to being active-high inputs
+    autopull=True,                    # Automatically pull the next word from FIFO into the output shift reg
+    pull_thresh=24,                   # Pull from FIFO when 24 bits of the OSR have been consumed
+    out_shiftdir=rp2.PIO.SHIFT_RIGHT, # Take bits from the least significant end of the shift register
+    sideset_init=(OUT_HIGH, OUT_LOW), # 15:dir (1 = IN to PicoW from CoCo); 16:trigger (1 = trigger oscilloscope capture)
+    autopush=True,                    # Automatically push the next word from input shift reg into FIFO
 )
 def on_data_read():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
     AARD_READ_D = 12  # GPIO strobe for Read Data (active high)
-    SM_IRQ = 4         # for State Machine communictaion
+    SM_IRQ = 4        # IRQ to wait on before responding to reads on the Data Port
 
-    # Wait for a singal from the control port.
     wrap_target()
     
-    irq(block, SM_IRQ)
-    set(y, 26)      # Letter 'Z' in VDG Text Mode
+    irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
 
+    set(y, 26) # Respond to this many Data Read strobes before stopping until the next Control Write
 
-    # Wait for Data Port read.
+    # Loop that responds to Data Port reads
     label("wait_data_port_read")
-    wait(0, gpio, AARD_READ_D)
-    wait(1, gpio, AARD_READ_D)
-
-    #jmp("wait_data_port_read")
-    #label("loop")
-    #jmp("loop")
-    #wrap()
-
-    #mov(pindirs, invert(null))   .side(0b0000) # trigger=1 direction=0=OUT Slenb=no Halt=no
-    #set(x, 31)
-    #mov(pindirs, x)   .side(0b1000) # trigger=1 direction=0=OUT Slenb=no Halt=no
-
-    set(pindirs, 31)
-    mov(pins, y).side(0b0000)
-    # NANDO # adding this line makes the coco3 crazy --> # wait(0, gpio, AARD_READ_D)
-    mov(pins, y).side(0b0100)
     
-    #wait(0, gpio, AARD_READ_D) # wait until strobe falls  # type: ignore
-    #mov(pindirs, null)   .side(0b0100) # trigger=0 direction=1=IN Slenb=no Halt=no
-    set(x, 0)     # or, mov(pindirs, null) ?
-    
-    # NANDO NANDO NANDO -- if I uncomment the next line, it kills the coco3.
-    # Why?  this changes the pindirs on THIS side of the LVC buffer.
-    # and 0 should be making them inputs.
-    #mov(pindirs, x)   .side(0b0100) # trigger=0 direction=1=IN Slenb=no Halt=no
-    # NANDO or how about set() instead?
-    set(pindirs, 0)
+    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is not being asserted (to prevent false positives)
+    wait(0, gpio, AARD_READ_D) # Wait until AARD_READ_D is being asserted
 
+    #mov(osr, invert(null))
+    out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side
 
-    irq(0)
+    out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)
+    #in_(pins, 8) # Send the current value of y to the input FIFO so that we can print what we sent to the PicoW console
+    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted
+    nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)
     
-    # After y reaches 0 ('@' on VDG Text Screen), don't respond to Data Read strobes.
+    #mov(osr, null)
+    out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side
+    
+    irq(0) # Tell the CPU that we have finished responding to a Data Read strobe
+    
+    # After y reaches 0, we will stop responding to Data Read strobes until the next Control Port Write
     jmp(y_dec, "wait_data_port_read")
-    # until we get the signal on the Control Port.
+
     wrap()
 
 pio0 = rp2.PIO(0)
@@ -128,13 +119,25 @@ sm_data_read = pio0.state_machine(
 sm_data_read.active(True)
 
 def handler(pio):
-    print('handler')
+    print(' handler called ')
+
 pio0.irq(handler)
 
+# Send a string to the CoCo
+def sendchar_task(sm_data_read, text):
+    for char in text:
+        word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
+        print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
+        sm_data_read.put(word_to_send)
+
+text = "Hello world from PIO!"
+_thread.start_new_thread(sendchar_task, (sm_data_read, text))
 
 # Blink LED at 1 Hz
 while True:
     AardLED.value(1)
     time.sleep(0.2)
+    #read_byte = sm_data_read.get()
+    #print(f'{read_byte} ({chr(read_byte)})')
     AardLED.value(0)
     time.sleep(0.8)
