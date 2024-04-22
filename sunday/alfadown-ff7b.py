@@ -39,7 +39,9 @@ FIRST_SIDESET_PIN = AardDir
 Led = machine.Pin("LED", machine.Pin.OUT, value=0)
 
 @rp2.asm_pio(
-    in_shiftdir=rp2.PIO.SHIFT_LEFT, # Shift bits into the most significant end of the shift register
+    in_shiftdir=rp2.PIO.SHIFT_LEFT,   # Shift bits into the most significant end of the shift register
+    autopush=True,                    # Automatically push the next word from input shift reg into FIFO
+    push_thresh=8,                    # Push to the FIFO when 8 bits of the ISR have been produced
 )
 def on_control_write():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
@@ -51,7 +53,11 @@ def on_control_write():
     wait(1, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is not being asserted (to prevent false positives)
     wait(0, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is being asserted
 
-    irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes
+    in_(pins, 8) # Send contents of data bus to input FIFO so they can be printed on the PicoW console
+
+    irq(0) # Tell the CPU that we have received a Control Write strobe
+
+    #irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes
 
     wrap()
 
@@ -61,7 +67,6 @@ def on_control_write():
     pull_thresh=24,                   # Pull from FIFO when 24 bits of the OSR have been consumed
     out_shiftdir=rp2.PIO.SHIFT_RIGHT, # Take bits from the least significant end of the shift register
     sideset_init=(OUT_HIGH, OUT_LOW), # 15:dir (1 = IN to PicoW from CoCo); 16:trigger (1 = trigger oscilloscope capture)
-    autopush=True,                    # Automatically push the next word from input shift reg into FIFO
 )
 def on_data_read():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
@@ -70,7 +75,7 @@ def on_data_read():
 
     wrap_target()
     
-    irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
+    #irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
 
     set(y, 26) # Respond to this many Data Read strobes before stopping until the next Control Write
 
@@ -84,14 +89,11 @@ def on_data_read():
     out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side
 
     out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)
-    #in_(pins, 8) # Send the current value of y to the input FIFO so that we can print what we sent to the PicoW console
     wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted
     nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)
     
     #mov(osr, null)
     out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side
-    
-    irq(0) # Tell the CPU that we have finished responding to a Data Read strobe
     
     # After y reaches 0, we will stop responding to Data Read strobes until the next Control Port Write
     jmp(y_dec, "wait_data_port_read")
@@ -105,6 +107,7 @@ sm_control_write = pio0.state_machine(
     0, # which state machine in pio0
     on_control_write,
     freq=125_000_000,
+    in_base=FIRST_DATA_PIN,
 )
 sm_control_write.active(True)
 
@@ -116,10 +119,14 @@ sm_data_read = pio0.state_machine(
     out_base=FIRST_DATA_PIN,
     sideset_base=FIRST_SIDESET_PIN,
 )
-sm_data_read.active(True)
+#sm_data_read.active(False)
 
 def handler(pio):
-    print(' handler called ')
+    print(' * Control Write received * ')
+    if sm_data_read.active():
+        sm_data_read.restart()
+    else:
+        sm_data_read.active(True)
 
 pio0.irq(handler)
 
@@ -133,11 +140,12 @@ def sendchar_task(sm_data_read, text):
 text = "Hello world from PIO!"
 _thread.start_new_thread(sendchar_task, (sm_data_read, text))
 
-# Blink LED at 1 Hz
+## Blink LED at 1 Hz
+AardLED.value(1)
 while True:
-    AardLED.value(1)
-    time.sleep(0.2)
-    #read_byte = sm_data_read.get()
-    #print(f'{read_byte} ({chr(read_byte)})')
-    AardLED.value(0)
-    time.sleep(0.8)
+    control_byte = sm_control_write.get()
+    print(f'{control_byte} ({chr(control_byte)})')
+    #AardLED.value(1)
+    #time.sleep(0.2)
+    #AardLED.value(0)
+    #time.sleep(0.8)
