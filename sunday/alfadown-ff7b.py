@@ -1,12 +1,17 @@
 # FOR Aardvark/V1
-
-# Any write to the Control Port at $FF7A allows output.
-# If output is allowed, reads from the Data Port at $FF7B will get 26, then 25, then 24... to 0.
-# When it reaches 0, output is no longer allowed, until the next write to Control Port.
-
-# Copyright (c) 2024 Phoenix Brown under MIT License
-# Copyright (c) 2024 Henry Strickland (GitHub: strickyak) under the MIT License
-# Copyright (c) 2024 Thomas Shanks; released under the standard MIT License
+#
+# Writing 0x01 to the Control Port at $FF7A (re)starts the PIO program that
+# sends bytes back to the CoCo in response Data Port reads. Each read from
+# the Data Port at $FF7B will get the next letter in letter in `TEXT_TO_SEND`
+# until the `TEXT_TO_SEND` string is exhausted. The PIO program will then
+# no longer respond to Data Port reads until the next write of 0x01 to the
+# Control Port.
+#
+# Copyright (c) 2024 Thomas Shanks (GitHub: thomasshanks),
+#                    Phoenix B (GitHub: phoenixvox),
+#                    Henry Strickland (GitHub: strickyak), and contributors;
+#   released under the standard MIT License, which is included in the LICENSE
+#   file in the repository.
 
 import time
 
@@ -74,14 +79,14 @@ def on_data_read():
     SM_IRQ = 4        # IRQ to wait on before responding to reads on the Data Port
 
     wrap_target()
-    
+
     #irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
 
     set(y, 26) # Respond to this many Data Read strobes before stopping until the next Control Write
 
     # Loop that responds to Data Port reads
     label("wait_data_port_read")
-    
+
     wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is not being asserted (to prevent false positives)
     wait(0, gpio, AARD_READ_D) # Wait until AARD_READ_D is being asserted
 
@@ -91,10 +96,10 @@ def on_data_read():
     out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)
     wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted
     nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)
-    
+
     #mov(osr, null)
     out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side
-    
+
     # After y reaches 0, we will stop responding to Data Read strobes until the next Control Port Write
     jmp(y_dec, "wait_data_port_read")
 
@@ -119,33 +124,44 @@ sm_data_read = pio0.state_machine(
     out_base=FIRST_DATA_PIN,
     sideset_base=FIRST_SIDESET_PIN,
 )
-#sm_data_read.active(False)
+
+TEXT_TO_SEND = "Hello world from PIO!\r"
+sendchar_should_restart = False
 
 def handler(pio):
-    print(' * Control Write received * ')
-    if sm_data_read.active():
-        sm_data_read.restart()
-    else:
-        sm_data_read.active(True)
+    global sendchar_should_restart
+
+    print(' * Control Write interrupt handler * ')
+    control_byte = sm_control_write.get()
+    print(f'Control Byte Received: {control_byte} ({chr(control_byte)})')
+    _thread.start_new_thread(sendchar_task, (sm_data_read, TEXT_TO_SEND))
+    if control_byte == 0x01:
+        if sm_data_read.active():
+            sendchar_should_restart = True
+            sm_data_read.restart()
+        else:
+            sm_data_read.active(True)
 
 pio0.irq(handler)
 
 # Send a string to the CoCo
 def sendchar_task(sm_data_read, text):
-    for char in text:
-        word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
-        print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
-        sm_data_read.put(word_to_send)
+    global sendchar_should_restart
 
-text = "Hello world from PIO!"
-_thread.start_new_thread(sendchar_task, (sm_data_read, text))
+    for char in text:
+        while not sendchar_should_restart:
+            if sm_data_read.tx_fifo() < 4:
+                word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
+                print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
+                sm_data_read.put(word_to_send)
+                break
+    sendchar_should_restart = False
+    _thread.exit()
 
 ## Blink LED at 1 Hz
 AardLED.value(1)
 while True:
-    control_byte = sm_control_write.get()
-    print(f'{control_byte} ({chr(control_byte)})')
-    #AardLED.value(1)
-    #time.sleep(0.2)
-    #AardLED.value(0)
-    #time.sleep(0.8)
+    AardLED.value(1)
+    time.sleep(0.2)
+    AardLED.value(0)
+    time.sleep(0.8)
