@@ -68,7 +68,7 @@ def on_control_write():
 
 @rp2.asm_pio(
     out_init=tuple(8 * [IN_HIGH]),    # Data bus pins will default to being active-high inputs
-    autopull=True,                    # Automatically pull the next word from FIFO into the output shift reg
+    #autopull=True,                    # Automatically pull the next word from FIFO into the output shift reg
     pull_thresh=24,                   # Pull from FIFO when 24 bits of the OSR have been consumed
     out_shiftdir=rp2.PIO.SHIFT_RIGHT, # Take bits from the least significant end of the shift register
     sideset_init=(OUT_HIGH, OUT_LOW), # 15:dir (1 = IN to PicoW from CoCo); 16:trigger (1 = trigger oscilloscope capture)
@@ -82,26 +82,18 @@ def on_data_read():
 
     #irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
 
-    set(y, 26) # Respond to this many Data Read strobes before stopping until the next Control Write
-
-    # Loop that responds to Data Port reads
-    label("wait_data_port_read")
+    pull(ifempty) # Get the next word from the FIFO and put it into the output shift register
 
     wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is not being asserted (to prevent false positives)
     wait(0, gpio, AARD_READ_D) # Wait until AARD_READ_D is being asserted
 
-    #mov(osr, invert(null))
     out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side
 
     out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)
     wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted
     nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)
 
-    #mov(osr, null)
     out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side
-
-    # After y reaches 0, we will stop responding to Data Read strobes until the next Control Port Write
-    jmp(y_dec, "wait_data_port_read")
 
     wrap()
 
@@ -124,39 +116,48 @@ sm_data_read = pio0.state_machine(
     out_base=FIRST_DATA_PIN,
     sideset_base=FIRST_SIDESET_PIN,
 )
+sm_data_read.active(True)
 
-TEXT_TO_SEND = "Hello world from PIO!\r"
-sendchar_should_restart = False
+TEXT_TO_SEND = "Hello world from PIO! We all live in a yellow submarine!!!\r"
+sendchar_should_stop = True
 
 def handler(pio):
-    global sendchar_should_restart
+    global sendchar_should_stop
 
-    print(' * Control Write interrupt handler * ')
     control_byte = sm_control_write.get()
     print(f'Control Byte Received: {control_byte} ({chr(control_byte)})')
-    _thread.start_new_thread(sendchar_task, (sm_data_read, TEXT_TO_SEND))
-    if control_byte == 0x01:
+    if control_byte == 0x00:
+        sendchar_should_stop = True
         if sm_data_read.active():
-            sendchar_should_restart = True
-            sm_data_read.restart()
-        else:
-            sm_data_read.active(True)
+            #sm_data_read.active(False)
+
+            # Empty the TX FIFO by throwing away the contents of the OSR five times
+            for _ in range(5):
+                sm_data_read.restart()
+    elif control_byte == 0x01:
+        sendchar_should_stop = False
+        #sm_data_read.active(True)
 
 pio0.irq(handler)
 
 # Send a string to the CoCo
 def sendchar_task(sm_data_read, text):
-    global sendchar_should_restart
+    global sendchar_should_stop
 
-    for char in text:
-        while not sendchar_should_restart:
-            if sm_data_read.tx_fifo() < 4:
-                word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
-                print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
-                sm_data_read.put(word_to_send)
+    while True:
+        for char in text:
+            while not sendchar_should_stop:
+                if sm_data_read.tx_fifo() < 4:
+                    word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
+                    print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
+                    sm_data_read.put(word_to_send)
+                    break
+            else: #if sendchar_should_stop:
+                # TODO: Wait on _thread.lock()
+
                 break
-    sendchar_should_restart = False
-    _thread.exit()
+
+_thread.start_new_thread(sendchar_task, (sm_data_read, TEXT_TO_SEND))
 
 ## Blink LED at 1 Hz
 AardLED.value(1)
