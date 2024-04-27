@@ -146,16 +146,28 @@ def sendchar_task(sm_data_read, text):
 
     while True:
         for char in text:
+            # Keep trying to send the next `char` in `text` until we have
+            # successfully sent it (or we are asked to stop sending)
             while not sendchar_should_stop:
+                # Don't try to send the next byte unless the TX FIFO has
+                # room for it
                 if sm_data_read.tx_fifo() < 4:
                     word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
                     print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
                     sm_data_read.put(word_to_send)
-                    break
-            else: #if sendchar_should_stop:
-                # TODO: Wait on _thread.lock()
 
+                    # Go on to the next `char` in the `text` string
+                    break
+            else: # if sendchar_should_stop:
+                # TODO: Wait on a _thread.lock() that indicates it is time
+                # to start sending text again instead of spinning in the
+                # `while True:` loop
+
+                # Exit the `for char in text:` loop
                 break
+        else: # if we've reached the end of the text
+            # then stop sending, but don't stop the state machine
+            sendchar_should_stop = True
 
 _thread.start_new_thread(sendchar_task, (sm_data_read, TEXT_TO_SEND))
 
@@ -166,3 +178,5 @@ while True:
     time.sleep(0.2)
     AardLED.value(0)
     time.sleep(0.8)
+    if sm_data_read.tx_fifo():
+        print(f'TX FIFO: {sm_data_read.tx_fifo()}')
