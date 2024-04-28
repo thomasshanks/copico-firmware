@@ -21,6 +21,13 @@ import _thread
 
 OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 
+NETIO_PIO = 0
+CONTROL_WRITE_SM = 0
+DATA_READ_SM = 1
+
+FIRST_DATA_PIN = 0
+DATA_BUS_WIDTH = 8
+
 AardLED = machine.Pin("LED", machine.Pin.OUT)
 
 AardWriteC = machine.Pin(10, machine.Pin.IN) # 0 = Write Control Port
@@ -32,14 +39,12 @@ AardSlenb = machine.Pin(14, machine.Pin.OUT) # 1 = Assert SLENB to CoCo
 AardDir = machine.Pin(15, machine.Pin.OUT)   # 1 = IN to PicoW from CoCo
 AardTrigger = machine.Pin(16, machine.Pin.OUT) # Debug output for triggering oscilloscope capture
 
+FIRST_SIDESET_PIN = AardDir
+
 AardLED.value(0)   # LED off
 AardHalt.value(0)  # 0 = Don't HALT; run CoCo
 AardSlenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
 AardDir.value(1)   # 1 = IN to PicoW from CoCo
-
-FIRST_DATA_PIN = 0
-DATA_BUS_WIDTH = 8
-FIRST_SIDESET_PIN = AardDir
 
 Led = machine.Pin("LED", machine.Pin.OUT, value=0)
 
@@ -97,11 +102,11 @@ def on_data_read():
 
     wrap()
 
-pio0 = rp2.PIO(0)
+pio0 = rp2.PIO(NETIO_PIO)
 
 pio0.add_program(on_control_write)
 sm_control_write = pio0.state_machine(
-    0, # which state machine in pio0
+    CONTROL_WRITE_SM, # which state machine in pio0
     on_control_write,
     freq=125_000_000,
     in_base=FIRST_DATA_PIN,
@@ -110,7 +115,7 @@ sm_control_write.active(True)
 
 pio0.add_program(on_data_read)
 sm_data_read = pio0.state_machine(
-    1, # which state machine in pio0
+    DATA_READ_SM, # which state machine in pio0
     on_data_read,
     freq=125_000_000,
     out_base=FIRST_DATA_PIN,
@@ -118,16 +123,15 @@ sm_data_read = pio0.state_machine(
 )
 sm_data_read.active(True)
 
-TEXT_TO_SEND = "Hello world from PIO! We all live in a yellow submarine!!!\r"
-sendchar_should_stop = True
+sendbytes_should_stop = True
 
 def handler(pio):
-    global sendchar_should_stop
+    global sendbytes_should_stop
 
     control_byte = sm_control_write.get()
     print(f'Control Byte Received: {control_byte} ({chr(control_byte)})')
     if control_byte == 0x00:
-        sendchar_should_stop = True
+        sendbytes_should_stop = True
         if sm_data_read.active():
             #sm_data_read.active(False)
 
@@ -135,30 +139,35 @@ def handler(pio):
             for _ in range(5):
                 sm_data_read.restart()
     elif control_byte == 0x01:
-        sendchar_should_stop = False
+        sendbytes_should_stop = False
         #sm_data_read.active(True)
 
 pio0.irq(handler)
 
-# Send a string to the CoCo
-def sendchar_task(sm_data_read, text):
-    global sendchar_should_stop
+BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r"
+
+def sendbytes_task(sm_data_read, bytes_to_send: bytes):
+    """ Enqueue bytes into TX FIFO of Data Read PIO State Machine so that it can send them to the CoCo."""
+
+    global sendbytes_should_stop
 
     while True:
-        for char in text:
+        for byte in bytes_to_send:
             # Keep trying to send the next `char` in `text` until we have
             # successfully sent it (or we are asked to stop sending)
-            while not sendchar_should_stop:
+            while not sendbytes_should_stop:
                 # Don't try to send the next byte unless the TX FIFO has
                 # room for it
                 if sm_data_read.tx_fifo() < 4:
-                    word_to_send = 0x0000FF + ((ord(char) & 0xFF) << 8)
-                    print(f'Queuing {hex(word_to_send)} ("{char}" surrounded by the pindirs)')
+                    # Wrap the byte to send with the pindirs values to
+                    # configure before (0xFF) and after (0x00)
+                    word_to_send = 0x0000FF | (byte << 8)
+                    print(f'Queuing {hex(word_to_send)} ("{chr(byte)}" surrounded by the pindirs)')
                     sm_data_read.put(word_to_send)
 
                     # Go on to the next `char` in the `text` string
                     break
-            else: # if sendchar_should_stop:
+            else: # if sendbytes_should_stop:
                 # TODO: Wait on a _thread.lock() that indicates it is time
                 # to start sending text again instead of spinning in the
                 # `while True:` loop
@@ -167,9 +176,9 @@ def sendchar_task(sm_data_read, text):
                 break
         else: # if we've reached the end of the text
             # then stop sending, but don't stop the state machine
-            sendchar_should_stop = True
+            sendbytes_should_stop = True
 
-_thread.start_new_thread(sendchar_task, (sm_data_read, TEXT_TO_SEND))
+_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
 
 ## Blink LED at 1 Hz
 AardLED.value(1)
