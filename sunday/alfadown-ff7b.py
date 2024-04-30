@@ -153,6 +153,34 @@ def handler(sm):
 sm_control_write.irq(handler=handler) # TODO: What are trigger=0|1 and hard=True|False for?
 
 BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r" 
+src_data_generator = ((0x0000_00FF | (byte << 8)).to_bytes(4, 'big') for byte in BYTES_TO_SEND)
+src_data = bytearray().join(src_data_generator)
+print(f'src_data[{len(src_data)}] = {src_data.hex()}')
+
+# This is for the DMA ctrl register treq_sel; see the example code in the
+# docs: https://docs.micropython.org/en/latest/library/rp2.DMA.html
+DATA_REQUEST_INDEX = (NETIO_PIO << 3) + DATA_READ_SM
+
+dma = rp2.DMA()
+
+# Transfer bytes, rather than words, don't increment the write address, and
+# pace the transfer based on the Data Read state machine's request for data
+dma_ctrl_val = dma.pack_ctrl(
+    default=0, # Clear all bits
+    size=2, # will send a word at a time
+    bswap=1, # swap the byte order
+    enable=1,
+    inc_read=1, # increment the read address
+    inc_write=0, # keep the same write address each time rather than incrementing
+    irq_quiet=1, # don't generate an IRQ when the transfer is complete
+    treq_sel=DATA_REQUEST_INDEX) # wait for the Data Read state machine to request data
+
+dma.config(read=src_data, # Where to read from
+           write=0x5020_0014, #sm_data_read, # Write to the Data Read state machine's TX FIFO
+           count=len(src_data) // 4, # Number of words to transfer
+           ctrl=dma_ctrl_val,
+           trigger=True) # Start the DMA transfer now
+
 
 def sendbytes_task(sm_data_read, bytes_to_send):
     """ Enqueue bytes into TX FIFO of Data Read PIO State Machine so that it can send them to the CoCo."""
@@ -185,7 +213,7 @@ def sendbytes_task(sm_data_read, bytes_to_send):
             # then stop sending, but don't stop the state machine
             sendbytes_should_stop = True
 
-_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
+#_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
 
 ## Blink LED at 1 Hz
 AardLED.value(1)
@@ -196,10 +224,14 @@ try:
         AardLED.value(0)
         time.sleep(0.8)
         if sm_data_read.tx_fifo():
+            print(f'DMA READ: {hex(dma.read)}') # type: ignore
+            print(f'DMA WRITE: {hex(dma.write)}') # type: ignore
+            print(f'DMA COUNT: {dma.count}') # type: ignore
             print(f'TX FIFO: {sm_data_read.tx_fifo()}')
 finally:
     del sm_data_read
     del sm_control_write
+    del dma
     print('PIO and DMA freed')
     import gc; gc.collect()
     print('gc complete')
