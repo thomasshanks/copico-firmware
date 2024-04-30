@@ -9,15 +9,21 @@
 #
 # Copyright (c) 2024 Thomas Shanks (GitHub: thomasshanks),
 #                    Phoenix B (GitHub: phoenixvox),
-#                    Henry Strickland (GitHub: strickyak), and contributors;
-#   released under the standard MIT License, which is included in the LICENSE
-#   file in the repository.
+#                    Henry Strickland (GitHub: strickyak)
+#
+# Released under the standard MIT License, which is included in the LICENSE
+# file in the repository.
+#
 
 import time
 
 import machine
+import micropython
 import rp2
 import _thread
+
+# allow interrupts to throw errors
+micropython.alloc_emergency_exception_buf(100)
 
 OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 
@@ -58,18 +64,18 @@ def on_control_write():
     AARD_WRITE_C = 10  # GPIO strobe for Write Control (active high)
     SM_IRQ = 4         # for State Machine communictaion
 
-    wrap_target()
+    wrap_target()                                                                                               # type: ignore
 
-    wait(1, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is not being asserted (to prevent false positives)
-    wait(0, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is being asserted
+    wait(1, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is not being asserted (to prevent false positives)    # type: ignore
+    wait(0, gpio, AARD_WRITE_C) # Wait until AARD_WRITE_C is being asserted                                     # type: ignore
 
-    in_(pins, 8) # Send contents of data bus to input FIFO so they can be printed on the PicoW console
+    in_(pins, 8) # Send contents of data bus to input FIFO so they can be printed on the PicoW console          # type: ignore
 
-    irq(0) # Tell the CPU that we have received a Control Write strobe
+    irq(0) # Tell the CPU that we have received a Control Write strobe                                          # type: ignore
 
-    #irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes
+    #irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes  # type: ignore
 
-    wrap()
+    wrap()                                                                                                      # type: ignore
 
 @rp2.asm_pio(
     out_init=tuple(8 * [IN_HIGH]),    # Data bus pins will default to being active-high inputs
@@ -83,39 +89,39 @@ def on_data_read():
     AARD_READ_D = 12  # GPIO strobe for Read Data (active high)
     SM_IRQ = 4        # IRQ to wait on before responding to reads on the Data Port
 
-    wrap_target()
+    wrap_target()                                                                                               # type: ignore
 
-    #irq(block, SM_IRQ) # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
+    # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
+    #irq(block, SM_IRQ)                                                                                          # type: ignore
 
-    pull(ifempty) # Get the next word from the FIFO and put it into the output shift register
+    pull(ifempty) # Get the next word from the FIFO and put it into the output shift register                   # type: ignore
 
-    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is not being asserted (to prevent false positives)
-    wait(0, gpio, AARD_READ_D) # Wait until AARD_READ_D is being asserted
+    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is not being asserted (to prevent false positives)      # type: ignore
+    wait(0, gpio, AARD_READ_D) # Wait until AARD_READ_D is being asserted                                       # type: ignore
 
-    out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side
+    out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side                                     # type: ignore
 
-    out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)
-    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted
-    nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)
+    out(pins, 8).side(0b10) # trigger=1; direction=0 (OUT to CoCo)                                              # type: ignore
+    wait(1, gpio, AARD_READ_D) # Wait until AARD_READ_D is no longer asserted                                   # type: ignore
+    nop().side(0b01) # trigger=0; direction=1 (IN from CoCo)                                                    # type: ignore
 
-    out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side
+    out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side                                      # type: ignore
 
-    wrap()
+    wrap()                                                                                                      # type: ignore
 
-pio0 = rp2.PIO(NETIO_PIO)
+# Remove all existing PIO programs from PIO 0
+rp2.PIO(NETIO_PIO).remove_program()
 
-pio0.add_program(on_control_write)
-sm_control_write = pio0.state_machine(
-    CONTROL_WRITE_SM, # which state machine in pio0
+sm_control_write = rp2.StateMachine(
+    (NETIO_PIO << 3) + CONTROL_WRITE_SM, # which state machine in pio0
     on_control_write,
     freq=125_000_000,
     in_base=FIRST_DATA_PIN,
 )
 sm_control_write.active(True)
 
-pio0.add_program(on_data_read)
-sm_data_read = pio0.state_machine(
-    DATA_READ_SM, # which state machine in pio0
+sm_data_read = rp2.StateMachine(
+    (NETIO_PIO << 3) + DATA_READ_SM, # which state machine in pio0
     on_data_read,
     freq=125_000_000,
     out_base=FIRST_DATA_PIN,
@@ -123,9 +129,11 @@ sm_data_read = pio0.state_machine(
 )
 sm_data_read.active(True)
 
+# This is a global variable that will be used to control when the
+# `sendbytes_task` enqueues bytes to send to the CoCo
 sendbytes_should_stop = True
 
-def handler(pio):
+def handler(sm):
     global sendbytes_should_stop
 
     control_byte = sm_control_write.get()
@@ -142,13 +150,12 @@ def handler(pio):
         sendbytes_should_stop = False
         #sm_data_read.active(True)
 
-pio0.irq(handler)
+sm_control_write.irq(handler=handler) # TODO: What are trigger=0|1 and hard=True|False for?
 
-BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r"
+BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r" 
 
-def sendbytes_task(sm_data_read, bytes_to_send: bytes):
+def sendbytes_task(sm_data_read, bytes_to_send):
     """ Enqueue bytes into TX FIFO of Data Read PIO State Machine so that it can send them to the CoCo."""
-
     global sendbytes_should_stop
 
     while True:
@@ -182,10 +189,18 @@ _thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
 
 ## Blink LED at 1 Hz
 AardLED.value(1)
-while True:
-    AardLED.value(1)
-    time.sleep(0.2)
+try:
+    while True:
+        AardLED.value(1)
+        time.sleep(0.2)
+        AardLED.value(0)
+        time.sleep(0.8)
+        if sm_data_read.tx_fifo():
+            print(f'TX FIFO: {sm_data_read.tx_fifo()}')
+finally:
+    del sm_data_read
+    del sm_control_write
+    print('PIO and DMA freed')
+    import gc; gc.collect()
+    print('gc complete')
     AardLED.value(0)
-    time.sleep(0.8)
-    if sm_data_read.tx_fifo():
-        print(f'TX FIFO: {sm_data_read.tx_fifo()}')
