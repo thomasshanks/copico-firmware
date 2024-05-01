@@ -22,8 +22,8 @@ import micropython
 import rp2
 import _thread
 
-# allow interrupts to throw errors
-micropython.alloc_emergency_exception_buf(100)
+import dma_defs
+import pio_defs
 
 OUT_HIGH, OUT_LOW, IN_HIGH = rp2.PIO.OUT_HIGH, rp2.PIO.OUT_LOW, rp2.PIO.IN_HIGH
 
@@ -34,25 +34,11 @@ DATA_READ_SM = 1
 FIRST_DATA_PIN = 0
 DATA_BUS_WIDTH = 8
 
-AardLED = machine.Pin("LED", machine.Pin.OUT)
+BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r" 
 
-AardWriteC = machine.Pin(10, machine.Pin.IN) # 0 = Write Control Port
-AardWriteD = machine.Pin(11, machine.Pin.IN) # 0 = Write Data Port
-AardReadD = machine.Pin(12, machine.Pin.IN)  # 0 = Read Data Port
-
-AardHalt = machine.Pin(13, machine.Pin.OUT)  # 1 = Halt CoCo
-AardSlenb = machine.Pin(14, machine.Pin.OUT) # 1 = Assert SLENB to CoCo
-AardDir = machine.Pin(15, machine.Pin.OUT)   # 1 = IN to PicoW from CoCo
-AardTrigger = machine.Pin(16, machine.Pin.OUT) # Debug output for triggering oscilloscope capture
-
-FIRST_SIDESET_PIN = AardDir
-
-AardLED.value(0)   # LED off
-AardHalt.value(0)  # 0 = Don't HALT; run CoCo
-AardSlenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
-AardDir.value(1)   # 1 = IN to PicoW from CoCo
-
-Led = machine.Pin("LED", machine.Pin.OUT, value=0)
+# This is a global variable that will be used to control when the
+# `sendbytes_task` enqueues bytes to send to the CoCo
+sendbytes_should_stop = True
 
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,   # Shift bits into the most significant end of the shift register
@@ -109,78 +95,47 @@ def on_data_read():
 
     wrap()                                                                                                      # type: ignore
 
-# Remove all existing PIO programs from PIO 0
-rp2.PIO(NETIO_PIO).remove_program()
+def set_up_and_start_pio_state_machines():
+    # Remove all existing PIO programs from PIO 0
+    rp2.PIO(NETIO_PIO).remove_program()
 
-sm_control_write = rp2.StateMachine(
-    (NETIO_PIO << 3) + CONTROL_WRITE_SM, # which state machine in pio0
-    on_control_write,
-    freq=125_000_000,
-    in_base=FIRST_DATA_PIN,
-)
-sm_control_write.active(True)
+    sm_control_write = rp2.StateMachine(
+        (NETIO_PIO << 3) + CONTROL_WRITE_SM, # which state machine in pio0
+        on_control_write,
+        freq=125_000_000,
+        in_base=FIRST_DATA_PIN,
+    )
+    sm_control_write.active(True)
 
-sm_data_read = rp2.StateMachine(
-    (NETIO_PIO << 3) + DATA_READ_SM, # which state machine in pio0
-    on_data_read,
-    freq=125_000_000,
-    out_base=FIRST_DATA_PIN,
-    sideset_base=FIRST_SIDESET_PIN,
-)
-sm_data_read.active(True)
+    sm_data_read = rp2.StateMachine(
+        (NETIO_PIO << 3) + DATA_READ_SM, # which state machine in pio0
+        on_data_read,
+        freq=125_000_000,
+        out_base=FIRST_DATA_PIN,
+        sideset_base=FIRST_SIDESET_PIN,
+    )
+    sm_data_read.active(True)
 
-# This is a global variable that will be used to control when the
-# `sendbytes_task` enqueues bytes to send to the CoCo
-sendbytes_should_stop = True
+    def handler(sm):
+        global sendbytes_should_stop
 
-def handler(sm):
-    global sendbytes_should_stop
+        control_byte = sm_control_write.get()
+        print(f'Control Byte Received: {hex(control_byte)}')
+        if control_byte == 0x00:
+            sendbytes_should_stop = True
+            if sm_data_read.active():
+                #sm_data_read.active(False)
 
-    control_byte = sm_control_write.get()
-    print(f'Control Byte Received: {control_byte} ({chr(control_byte)})')
-    if control_byte == 0x00:
-        sendbytes_should_stop = True
-        if sm_data_read.active():
-            #sm_data_read.active(False)
+                # Empty the TX FIFO by throwing away the contents of the OSR five times
+                for _ in range(5):
+                    sm_data_read.restart()
+        elif control_byte == 0x01:
+            sendbytes_should_stop = False
+            #sm_data_read.active(True)
 
-            # Empty the TX FIFO by throwing away the contents of the OSR five times
-            for _ in range(5):
-                sm_data_read.restart()
-    elif control_byte == 0x01:
-        sendbytes_should_stop = False
-        #sm_data_read.active(True)
+    sm_control_write.irq(handler=handler) # TODO: What are trigger=0|1 and hard=True|False for?
 
-sm_control_write.irq(handler=handler) # TODO: What are trigger=0|1 and hard=True|False for?
-
-BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r" 
-src_data_generator = ((0x0000_00FF | (byte << 8)).to_bytes(4, 'big') for byte in BYTES_TO_SEND)
-src_data = bytearray().join(src_data_generator)
-print(f'src_data[{len(src_data)}] = {src_data.hex()}')
-
-# This is for the DMA ctrl register treq_sel; see the example code in the
-# docs: https://docs.micropython.org/en/latest/library/rp2.DMA.html
-DATA_REQUEST_INDEX = (NETIO_PIO << 3) + DATA_READ_SM
-
-dma = rp2.DMA()
-
-# Transfer bytes, rather than words, don't increment the write address, and
-# pace the transfer based on the Data Read state machine's request for data
-dma_ctrl_val = dma.pack_ctrl(
-    default=0, # Clear all bits
-    size=2, # will send a word at a time
-    bswap=1, # swap the byte order
-    enable=1,
-    inc_read=1, # increment the read address
-    inc_write=0, # keep the same write address each time rather than incrementing
-    irq_quiet=1, # don't generate an IRQ when the transfer is complete
-    treq_sel=DATA_REQUEST_INDEX) # wait for the Data Read state machine to request data
-
-dma.config(read=src_data, # Where to read from
-           write=0x5020_0014, #sm_data_read, # Write to the Data Read state machine's TX FIFO
-           count=len(src_data) // 4, # Number of words to transfer
-           ctrl=dma_ctrl_val,
-           trigger=True) # Start the DMA transfer now
-
+    return sm_control_write, sm_data_read
 
 def sendbytes_task(sm_data_read, bytes_to_send):
     """ Enqueue bytes into TX FIFO of Data Read PIO State Machine so that it can send them to the CoCo."""
@@ -213,26 +168,76 @@ def sendbytes_task(sm_data_read, bytes_to_send):
             # then stop sending, but don't stop the state machine
             sendbytes_should_stop = True
 
-#_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
+def create_and_start_dma():
+    tx_data_bytearray = bytearray().join(
+        (0x0000_00FF | (byte << 8)).to_bytes(4, 'little') for byte in BYTES_TO_SEND)
+    print(f'src_data[{len(tx_data_bytearray)}] = {tx_data_bytearray.hex()}')
 
-## Blink LED at 1 Hz
-AardLED.value(1)
-try:
-    while True:
-        AardLED.value(1)
-        time.sleep(0.2)
+    dma = rp2.DMA()
+
+    dma_ctrl_val = dma.pack_ctrl(
+        default=0, # set all fields to 0 by default
+        size=dma_defs.SIZE_4BYTES, # send a word at a time
+        bswap=0, # Don't swap the byte order
+        enable=1, # enable this DMA channel
+        inc_read=1, # increment the read address
+        inc_write=0, # keep the same write address each time rather than incrementing
+        irq_quiet=1, # don't generate an IRQ when the transfer is complete
+        treq_sel=dma_defs.DREQ_PIO0_TX1) # wait for Data Read state machine TX FIFO to have space before sending
+
+    dma.config(read=tx_data_bytearray, # where to read from
+            #write=sm_data_read, # (Specifying the state machine here doesn't work until the next version of uPy)
+            write=pio_defs.PIO0_BASE + pio_defs.TXF1_OFFSET, # write to the Data Read state machine's TX FIFO
+            count=len(tx_data_bytearray) // 4, # number of words to transfer
+            ctrl=dma_ctrl_val,
+            trigger=True) # start the DMA transfer now
+
+    return dma
+
+if __name__ == "__main__":
+    # allow interrupts to throw errors
+    micropython.alloc_emergency_exception_buf(100)
+
+    AardLED = machine.Pin("LED", machine.Pin.OUT)
+
+    AardWriteC = machine.Pin(10, machine.Pin.IN) # 0 = Write Control Port
+    AardWriteD = machine.Pin(11, machine.Pin.IN) # 0 = Write Data Port
+    AardReadD = machine.Pin(12, machine.Pin.IN)  # 0 = Read Data Port
+
+    AardHalt = machine.Pin(13, machine.Pin.OUT)  # 1 = Halt CoCo
+    AardSlenb = machine.Pin(14, machine.Pin.OUT) # 1 = Assert SLENB to CoCo
+    AardDir = machine.Pin(15, machine.Pin.OUT)   # 1 = IN to PicoW from CoCo
+    AardTrigger = machine.Pin(16, machine.Pin.OUT) # Debug output for triggering oscilloscope capture
+
+    FIRST_SIDESET_PIN = AardDir
+
+    AardLED.value(0)   # LED off
+    AardHalt.value(0)  # 0 = Don't HALT; run CoCo
+    AardSlenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
+    AardDir.value(1)   # 1 = IN to PicoW from CoCo
+
+    sm_control_write, sm_data_read = set_up_and_start_pio_state_machines()
+
+    #_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
+    dma = create_and_start_dma()
+
+    # Blink LED at 1 Hz
+    AardLED.value(1)
+    try:
+        while True:
+            AardLED.value(1)
+            time.sleep(0.2)
+            AardLED.value(0)
+            time.sleep(0.8)
+            if dma.count: # type: ignore
+                print(f'DMA TXFRS REMAINING: {dma.count}') # type: ignore
+            if sm_data_read.tx_fifo():
+                print(f'TX FIFO: {sm_data_read.tx_fifo()}')
+    finally:
+        del sm_data_read
+        del sm_control_write
+        del dma
+        print('PIO and DMA freed')
+        import gc; gc.collect()
+        print('gc complete')
         AardLED.value(0)
-        time.sleep(0.8)
-        if sm_data_read.tx_fifo():
-            print(f'DMA READ: {hex(dma.read)}') # type: ignore
-            print(f'DMA WRITE: {hex(dma.write)}') # type: ignore
-            print(f'DMA COUNT: {dma.count}') # type: ignore
-            print(f'TX FIFO: {sm_data_read.tx_fifo()}')
-finally:
-    del sm_data_read
-    del sm_control_write
-    del dma
-    print('PIO and DMA freed')
-    import gc; gc.collect()
-    print('gc complete')
-    AardLED.value(0)
