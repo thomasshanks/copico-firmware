@@ -15,6 +15,7 @@
 # file in the repository.
 #
 
+#import atexit
 import time
 
 import machine
@@ -34,11 +35,7 @@ DATA_READ_SM = 1
 FIRST_DATA_PIN = 0
 DATA_BUS_WIDTH = 8
 
-BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r" 
-
-# This is a global variable that will be used to control when the
-# `sendbytes_task` enqueues bytes to send to the CoCo
-sendbytes_should_stop = True
+BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r"
 
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,   # Shift bits into the most significant end of the shift register
@@ -95,104 +92,175 @@ def on_data_read():
 
     wrap()                                                                                                      # type: ignore
 
-def set_up_and_start_pio_state_machines():
-    # Remove all existing PIO programs from PIO 0
-    rp2.PIO(NETIO_PIO).remove_program()
+class PIOStateMachineManager:
+    def __init__(self, data_producer=None):
+        self.data_producer = data_producer
+        self.set_up_state_machines()
+        #self.start_state_machines()
 
-    sm_control_write = rp2.StateMachine(
-        (NETIO_PIO << 3) + CONTROL_WRITE_SM, # which state machine in pio0
-        on_control_write,
-        freq=125_000_000,
-        in_base=FIRST_DATA_PIN,
-    )
-    sm_control_write.active(True)
+    def cleanup(self):
+        self.sm_control_write.active(False)
 
-    sm_data_read = rp2.StateMachine(
-        (NETIO_PIO << 3) + DATA_READ_SM, # which state machine in pio0
-        on_data_read,
-        freq=125_000_000,
-        out_base=FIRST_DATA_PIN,
-        sideset_base=FIRST_SIDESET_PIN,
-    )
-    sm_data_read.active(True)
+        self.stop_sending_data()
+        self.sm_data_read.active(False)
 
-    def handler(sm):
-        global sendbytes_should_stop
+        del self.sm_control_write
+        del self.sm_data_read
 
-        control_byte = sm_control_write.get()
-        print(f'Control Byte Received: {hex(control_byte)}')
-        if control_byte == 0x00:
-            sendbytes_should_stop = True
-            if sm_data_read.active():
-                #sm_data_read.active(False)
+    def set_up_state_machines(self):
+        # Remove all existing PIO programs from PIO 0
+        rp2.PIO(NETIO_PIO).remove_program()
 
-                # Empty the TX FIFO by throwing away the contents of the OSR five times
-                for _ in range(5):
-                    sm_data_read.restart()
-        elif control_byte == 0x01:
-            sendbytes_should_stop = False
-            #sm_data_read.active(True)
+        self.sm_control_write = rp2.StateMachine(
+            (NETIO_PIO << 3) + CONTROL_WRITE_SM, # which state machine in pio0
+            on_control_write,
+            freq=125_000_000,
+            in_base=FIRST_DATA_PIN,
+        )
 
-    sm_control_write.irq(handler=handler) # TODO: What are trigger=0|1 and hard=True|False for?
+        self.sm_data_read = rp2.StateMachine(
+            (NETIO_PIO << 3) + DATA_READ_SM, # which state machine in pio0
+            on_data_read,
+            freq=125_000_000,
+            out_base=FIRST_DATA_PIN,
+            sideset_base=FIRST_SIDESET_PIN,
+        )
 
-    return sm_control_write, sm_data_read
+        def handler(sm):
+            control_byte = self.sm_control_write.get()
+            print(f'Control Byte Received: {hex(control_byte)}')
+            if control_byte == 0x00:
+                self.stop_sending_data()
+            elif control_byte == 0x01:
+                self.start_sending_data()
 
-def sendbytes_task(sm_data_read, bytes_to_send):
-    """ Enqueue bytes into TX FIFO of Data Read PIO State Machine so that it can send them to the CoCo."""
-    global sendbytes_should_stop
+        # TODO: What are the `trigger=0|1` and `hard=True|False` options on `.irq(..)` for?
+        self.sm_control_write.irq(handler=handler)
 
-    while True:
-        for byte in bytes_to_send:
-            # Keep trying to send the next `char` in `text` until we have
-            # successfully sent it (or we are asked to stop sending)
-            while not sendbytes_should_stop:
-                # Don't try to send the next byte unless the TX FIFO has
-                # room for it
-                if sm_data_read.tx_fifo() < 4:
-                    # Wrap the byte to send with the pindirs values to
-                    # configure before (0xFF) and after (0x00)
-                    word_to_send = 0x0000FF | (byte << 8)
-                    print(f'Queuing {hex(word_to_send)} ("{chr(byte)}" surrounded by the pindirs)')
-                    sm_data_read.put(word_to_send)
+    def start_state_machines(self):
+        self.sm_control_write.active(True)
+        self.sm_data_read.active(True)
 
-                    # Go on to the next `char` in the `text` string
+    def start_sending_data(self):
+        if self.data_producer:
+            self.data_producer.start_sending_data()
+
+        #self.sm_data_read.active(True)
+
+    def stop_sending_data(self):
+        if self.data_producer:
+            self.data_producer.stop_sending_data()
+
+        if self.sm_data_read.active():
+            #self.sm_data_read.active(False)
+
+            # Empty the TX FIFO by throwing away the contents of the OSR five times
+            for _ in range(5):
+                self.sm_data_read.restart()
+
+class CPUDataProducer:
+    def __init__(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
+        self.thread_started = False
+        self.should_exit = False
+        self.should_send_data = False
+
+        self.sm_data_read = sm_data_read
+        self.bytes_to_send = bytes_to_send
+
+    def cleanup(self):
+        self.stop_sending_data()
+        self.should_exit = True
+
+    def bytes_left(self):
+        return 0 # Not implemented
+
+    def start_sending_data(self):
+        self.should_send_data = True
+
+        if not self.thread_started:
+            self.thread_started = True
+            _thread.start_new_thread(self._senddata_task, (self.sm_data_read, self.bytes_to_send))
+
+    def stop_sending_data(self):
+        self.should_send_data = False
+
+    def _senddata_task(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
+        """Enqueue data into Data Read PIO State Machine's TX FIFO for sending to the CoCo."""
+
+        while not self.should_exit:
+            for byte in bytes_to_send:
+                # Keep trying to send the next `byte` in `bytes_to_send` until we have
+                # successfully sent it or we are asked to stop sending data
+                while self.should_send_data:
+                    # Don't try to send the next byte unless the TX FIFO has
+                    # room for it
+                    if sm_data_read.tx_fifo() < 4:
+                        # Wrap the byte to send with the pindirs values to
+                        # configure before (0xFF) and after (0x00)
+                        word_to_send = 0x0000FF | (byte << 8)
+                        print(f'Queuing {hex(word_to_send)} ("{chr(byte)}" surrounded by the pindirs)')
+                        sm_data_read.put(word_to_send)
+
+                        # Go on to the next `byte` in `bytes_to_send`
+                        break
+                else: # if not self.should_send_data:
+                    # TODO: Wait on a _thread.lock() that indicates it is time
+                    # to start sending data again instead of spinning in the
+                    # `while True:` loop
+
+                    # Exit the `for byte in bytes_to_send:` loop
                     break
-            else: # if sendbytes_should_stop:
-                # TODO: Wait on a _thread.lock() that indicates it is time
-                # to start sending text again instead of spinning in the
-                # `while True:` loop
+            else: # if we've reached the end of the data
+                # then stop sending, but don't stop the state machine
+                self.should_send_data = False
 
-                # Exit the `for char in text:` loop
-                break
-        else: # if we've reached the end of the text
-            # then stop sending, but don't stop the state machine
-            sendbytes_should_stop = True
+class DMADataProducer:
+    def __init__(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
+        self.sm_data_read = sm_data_read
 
-def create_and_start_dma():
-    tx_data_bytearray = bytearray().join(
-        (0x0000_00FF | (byte << 8)).to_bytes(4, 'little') for byte in BYTES_TO_SEND)
-    print(f'src_data[{len(tx_data_bytearray)}] = {tx_data_bytearray.hex()}')
+        # Wrap each byte to send in the `pindirs` information, which the PIO will
+        # use to set the direction of the GPIO pins that are connected to the data
+        # bus
+        self.tx_data_bytearray = bytearray().join(
+            (0x0000_00FF | (byte << 8)).to_bytes(4, 'little') for byte in BYTES_TO_SEND)
+        print(f'src_data[{len(self.tx_data_bytearray)}] = {self.tx_data_bytearray.hex()}')
 
-    dma = rp2.DMA()
+        self.dma = rp2.DMA()
 
-    dma_ctrl_val = dma.pack_ctrl(
-        default=0, # set all fields to 0 by default
-        size=dma_defs.SIZE_4BYTES, # send a word at a time
-        bswap=0, # Don't swap the byte order
-        enable=1, # enable this DMA channel
-        inc_read=1, # increment the read address
-        inc_write=0, # keep the same write address each time rather than incrementing
-        irq_quiet=1, # don't generate an IRQ when the transfer is complete
-        treq_sel=dma_defs.DREQ_PIO0_TX1) # wait for Data Read state machine TX FIFO to have space before sending
+        #atexit.register(self.cleanup)
 
-    dma.config(read=tx_data_bytearray, # where to read from
-            #write=sm_data_read, # (Specifying the state machine here doesn't work until the next version of uPy)
-            write=pio_defs.PIO0_BASE + pio_defs.TXF1_OFFSET, # write to the Data Read state machine's TX FIFO
-            count=len(tx_data_bytearray) // 4, # number of words to transfer
-            ctrl=dma_ctrl_val,
-            trigger=True) # start the DMA transfer now
+    def bytes_left(self):
+        return self.dma.count # type: ignore
 
-    return dma
+    def cleanup(self):
+        self.stop_sending_data()
+        self.dma.close()
+        del self.dma
+        del self.tx_data_bytearray
+
+    def start_sending_data(self):
+        # See https://github.com/Hack-a-Day/Vectorscope/blob/main/source/pixel_pusher.py for
+        # an example of how to use the DMA to send data to a PIO state machine
+
+        dma_ctrl_val = self.dma.pack_ctrl(
+            default=0, # set all fields to 0 by default
+            size=dma_defs.SIZE_4BYTES, # send a word at a time
+            bswap=0, # Don't swap the byte order
+            enable=1, # enable this DMA channel
+            inc_read=1, # increment the read address
+            inc_write=0, # keep the same write address each time rather than incrementing
+            irq_quiet=1, # don't generate an IRQ when the transfer is complete
+            treq_sel=dma_defs.DREQ_PIO0_TX1) # wait for Data Read state machine TX FIFO to have space before sending
+
+        self.dma.config(read=self.tx_data_bytearray, # where to read from
+                #write=sm_data_read, # (Specifying the state machine here doesn't work until the next version of uPy)
+                write=pio_defs.PIO0_BASE + pio_defs.TXF1_OFFSET, # write to the Data Read state machine's TX FIFO
+                count=len(self.tx_data_bytearray) // 4, # number of words to transfer
+                ctrl=dma_ctrl_val,
+                trigger=True) # start the DMA transfer now
+
+    def stop_sending_data(self):
+        self.dma.active(False)
 
 if __name__ == "__main__":
     # allow interrupts to throw errors
@@ -216,10 +284,16 @@ if __name__ == "__main__":
     AardSlenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
     AardDir.value(1)   # 1 = IN to PicoW from CoCo
 
-    sm_control_write, sm_data_read = set_up_and_start_pio_state_machines()
+    sm_mgr = PIOStateMachineManager()
 
-    #_thread.start_new_thread(sendbytes_task, (sm_data_read, BYTES_TO_SEND))
-    dma = create_and_start_dma()
+    # Both of these currently work, but the DMA version is more efficient
+    data_producer = CPUDataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
+    #data_producer = DMADataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
+
+    sm_mgr.data_producer = data_producer
+
+    sm_mgr.start_state_machines()
+    #data_producer.start_sending_data()
 
     # Blink LED at 1 Hz
     AardLED.value(1)
@@ -229,14 +303,15 @@ if __name__ == "__main__":
             time.sleep(0.2)
             AardLED.value(0)
             time.sleep(0.8)
-            if dma.count: # type: ignore
-                print(f'DMA TXFRS REMAINING: {dma.count}') # type: ignore
-            if sm_data_read.tx_fifo():
-                print(f'TX FIFO: {sm_data_read.tx_fifo()}')
+            if data_producer.bytes_left() > 0:
+                print(f'DATA REMAINING: {data_producer.bytes_left()}')
+            if sm_mgr.sm_data_read.tx_fifo():
+                print(f'TX FIFO: {sm_mgr.sm_data_read.tx_fifo()}')
     finally:
-        del sm_data_read
-        del sm_control_write
-        del dma
+        sm_mgr.cleanup()
+        del sm_mgr
+        data_producer.cleanup()
+        del data_producer
         print('PIO and DMA freed')
         import gc; gc.collect()
         print('gc complete')
