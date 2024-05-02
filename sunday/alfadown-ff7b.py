@@ -1,11 +1,4 @@
-# FOR Aardvark/V1
-#
-# Writing 0x01 to the Control Port at $FF7A (re)starts the PIO program that
-# sends bytes back to the CoCo in response Data Port reads. Each read from
-# the Data Port at $FF7B will get the next letter in letter in `TEXT_TO_SEND`
-# until the `TEXT_TO_SEND` string is exhausted. The PIO program will then
-# no longer respond to Data Port reads until the next write of 0x01 to the
-# Control Port.
+#!/usr/bin/env python3
 #
 # Copyright (c) 2024 Thomas Shanks (GitHub: thomasshanks),
 #                    Phoenix B (GitHub: phoenixvox),
@@ -14,14 +7,56 @@
 # Released under the standard MIT License, which is included in the LICENSE
 # file in the repository.
 #
+# SPDX-License-Identifier: MIT
+#
+# --------------------- CoPiCo Proof of Concept Firmware --------------------
+#
+# netio: Respond to NETIO Control Port writes and Data Port reads
+#
+# ----------------------------------------------------------------------------
+#
+# This program is a proof of concept for the CoPiCo project. It demonstrates
+# how to use the RP2040's PIO state machines to respond to writes to the
+# Control Port and reads from the Data Port. The Control Port is used to start
+# and stop sending data to the CoCo, while the Data Port is used to send data
+# back to the CoCo in response to reads.
+#
+# Control Port Operation 0x01: Start sending data to CoCo
+#
+#   Writing 0x01 to the Control Port at $FF7A starts the PIO program that
+#   sends bytes back to the CoCo in response to Data Port reads. Each read
+#   from the Data Port at $FF7B will get the next byte in `BYTES_TO_SEND`
+#   buffer until that buffer is exhausted. The PIO program will then no longer
+#   respond to Data Port reads until the next write of 0x01 to the Control
+#   Port.
+#
+# Control Port Operation 0x00: Stop sending data to CoCo
+#
+#   Writing 0x00 to the Control Port at $FF7A stops the PIO program that sends
+#   bytes back to the CoCo in response to Data Port reads. The PIO program
+#   will no longer respond to Data Port reads until the next write of 0x01 to
+#   the Control Port.
+#
+#
+# NOTE: Currently only supports the Aardvark/V1 board!
+#
 
-#import atexit
+#from __future__ import annotations # Not supported on MicroPython
+
+#import atexit # Not supported on MicroPython
 import time
 
 import machine
 import micropython
 import rp2
 import _thread
+#from abc import ABC, abstractmethod # Not supported on MicroPython
+
+# A special constant that is assumed to be True by 3rd party static type checkers. It is False at runtime.
+TYPE_CHECKING = False
+
+if TYPE_CHECKING:
+    from typing import Optional # Not supported on MicroPython
 
 import dma_defs
 import pio_defs
@@ -92,20 +127,23 @@ def on_data_read():
 
     wrap()                                                                                                      # type: ignore
 
-class PIOStateMachineManager:
-    def __init__(self, data_producer=None):
-        self.data_producer = data_producer
-        self.set_up_state_machines()
-        #self.start_state_machines()
+class DataProducer(): # ABC
+    bytes_left: int
+
+    def start_sending_data(self):
+        raise NotImplementedError("Subclasses must implement this method")
+
+    def stop_sending_data(self):
+        raise NotImplementedError("Subclasses must implement this method")
 
     def cleanup(self):
-        self.sm_control_write.active(False)
+        raise NotImplementedError("Subclasses must implement this method")
 
-        self.stop_sending_data()
-        self.sm_data_read.active(False)
-
-        del self.sm_control_write
-        del self.sm_data_read
+class PIOStateMachineManager:
+    def __init__(self, data_producer: "Optional[DataProducer]" = None):
+        self.data_producer = data_producer
+        self.sm_control_write = None
+        self.sm_data_read = None
 
     def set_up_state_machines(self):
         # Remove all existing PIO programs from PIO 0
@@ -127,6 +165,9 @@ class PIOStateMachineManager:
         )
 
         def handler(sm):
+            if not self.sm_control_write:
+                raise ValueError("Control Write State Machine has not been set up")
+
             control_byte = self.sm_control_write.get()
             print(f'Control Byte Received: {hex(control_byte)}')
             if control_byte == 0x00:
@@ -138,6 +179,9 @@ class PIOStateMachineManager:
         self.sm_control_write.irq(handler=handler)
 
     def start_state_machines(self):
+        if not self.sm_control_write or not self.sm_data_read:
+            raise ValueError("State machines have not been set up")
+
         self.sm_control_write.active(True)
         self.sm_data_read.active(True)
 
@@ -151,15 +195,27 @@ class PIOStateMachineManager:
         if self.data_producer:
             self.data_producer.stop_sending_data()
 
-        if self.sm_data_read.active():
+        if self.sm_data_read and self.sm_data_read.active():
             #self.sm_data_read.active(False)
 
             # Empty the TX FIFO by throwing away the contents of the OSR five times
             for _ in range(5):
                 self.sm_data_read.restart()
 
-class CPUDataProducer:
-    def __init__(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
+    def stop_state_machines(self):
+        if self.sm_control_write:
+            self.sm_control_write.active(False)
+        if self.sm_data_read:
+            self.sm_data_read.active(False)
+
+    def cleanup(self):
+        self.stop_sending_data()
+        self.stop_state_machines()
+        del self.sm_control_write
+        del self.sm_data_read
+
+class CPUDataProducer(DataProducer):
+    def __init__(self, sm_data_read: Optional[rp2.StateMachine], bytes_to_send: bytes):
         self.thread_started = False
         self.should_exit = False
         self.should_send_data = False
@@ -167,12 +223,7 @@ class CPUDataProducer:
         self.sm_data_read = sm_data_read
         self.bytes_to_send = bytes_to_send
 
-    def cleanup(self):
-        self.stop_sending_data()
-        self.should_exit = True
-
-    def bytes_left(self):
-        return 0 # Not implemented
+        self.bytes_left = 0
 
     def start_sending_data(self):
         self.should_send_data = True
@@ -184,14 +235,21 @@ class CPUDataProducer:
     def stop_sending_data(self):
         self.should_send_data = False
 
+    def cleanup(self):
+        self.stop_sending_data()
+        self.should_exit = True
+
     def _senddata_task(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
         """Enqueue data into Data Read PIO State Machine's TX FIFO for sending to the CoCo."""
+        buff_length = len(bytes_to_send)
 
         while not self.should_exit:
-            for byte in bytes_to_send:
+            for index, byte in enumerate(bytes_to_send):
                 # Keep trying to send the next `byte` in `bytes_to_send` until we have
                 # successfully sent it or we are asked to stop sending data
                 while self.should_send_data:
+                    self.bytes_left = buff_length - index
+
                     # Don't try to send the next byte unless the TX FIFO has
                     # room for it
                     if sm_data_read.tx_fifo() < 4:
@@ -204,18 +262,22 @@ class CPUDataProducer:
                         # Go on to the next `byte` in `bytes_to_send`
                         break
                 else: # if not self.should_send_data:
+                    self.bytes_left = 0
+
                     # TODO: Wait on a _thread.lock() that indicates it is time
                     # to start sending data again instead of spinning in the
                     # `while True:` loop
 
                     # Exit the `for byte in bytes_to_send:` loop
                     break
-            else: # if we've reached the end of the data
-                # then stop sending, but don't stop the state machine
+            else: # if we've reached the end of the data...
+                self.bytes_left = 0
+
+                # ... then stop sending, but don't stop the state machine
                 self.should_send_data = False
 
-class DMADataProducer:
-    def __init__(self, sm_data_read: rp2.StateMachine, bytes_to_send: bytes):
+class DMADataProducer(DataProducer):
+    def __init__(self, sm_data_read: "Optional[rp2.StateMachine]", bytes_to_send: bytes):
         self.sm_data_read = sm_data_read
 
         # Wrap each byte to send in the `pindirs` information, which the PIO will
@@ -229,14 +291,9 @@ class DMADataProducer:
 
         #atexit.register(self.cleanup)
 
-    def bytes_left(self):
+    @property
+    def bytes_left(self) -> int:
         return self.dma.count # type: ignore
-
-    def cleanup(self):
-        self.stop_sending_data()
-        self.dma.close()
-        del self.dma
-        del self.tx_data_bytearray
 
     def start_sending_data(self):
         # See https://github.com/Hack-a-Day/Vectorscope/blob/main/source/pixel_pusher.py for
@@ -262,6 +319,12 @@ class DMADataProducer:
     def stop_sending_data(self):
         self.dma.active(False)
 
+    def cleanup(self):
+        self.stop_sending_data()
+        self.dma.close()
+        del self.dma
+        del self.tx_data_bytearray
+
 if __name__ == "__main__":
     # allow interrupts to throw errors
     micropython.alloc_emergency_exception_buf(100)
@@ -286,14 +349,15 @@ if __name__ == "__main__":
 
     sm_mgr = PIOStateMachineManager()
 
+    sm_mgr.set_up_state_machines()
+
     # Both of these currently work, but the DMA version is more efficient
-    data_producer = CPUDataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
-    #data_producer = DMADataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
+    #data_producer = CPUDataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
+    data_producer = DMADataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
 
     sm_mgr.data_producer = data_producer
 
     sm_mgr.start_state_machines()
-    #data_producer.start_sending_data()
 
     # Blink LED at 1 Hz
     AardLED.value(1)
@@ -303,9 +367,9 @@ if __name__ == "__main__":
             time.sleep(0.2)
             AardLED.value(0)
             time.sleep(0.8)
-            if data_producer.bytes_left() > 0:
-                print(f'DATA REMAINING: {data_producer.bytes_left()}')
-            if sm_mgr.sm_data_read.tx_fifo():
+            if data_producer.bytes_left > 0:
+                print(f'DATA REMAINING: {data_producer.bytes_left}')
+            if sm_mgr.sm_data_read and sm_mgr.sm_data_read.tx_fifo():
                 print(f'TX FIFO: {sm_mgr.sm_data_read.tx_fifo()}')
     finally:
         sm_mgr.cleanup()
