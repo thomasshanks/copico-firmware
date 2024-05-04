@@ -70,7 +70,7 @@ DATA_READ_SM = 1
 FIRST_DATA_PIN = 0
 DATA_BUS_WIDTH = 8
 
-BYTES_TO_SEND = b"Hello world from PIO! We all live in a yellow submarine!!!\r"
+BYTES_TO_SEND = b"ALL wiznet AND NO pico MAKES coco A DULL computer!\r"
 
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,   # Shift bits into the most significant end of the shift register
