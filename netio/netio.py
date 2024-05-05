@@ -46,19 +46,20 @@
 #import atexit # Not supported on MicroPython
 import time
 
-import machine
 import micropython
 import rp2
 import _thread
 
 import aardvark_v1 as board
+import wifi
+
 #from abc import ABC, abstractmethod # Not supported on MicroPython
 
 # A special constant that is assumed to be True by 3rd party static type checkers. It is False at runtime.
 TYPE_CHECKING = False
 
 if TYPE_CHECKING:
-    from typing import Optional # Not supported on MicroPython
+    from typing import Optional
 
 import dma_defs
 import pio_defs
@@ -71,7 +72,8 @@ DATA_READ_SM = 1
 
 DATA_BUS_WIDTH = 8
 
-BYTES_TO_SEND = b"ALL wiznet AND NO pico MAKES coco A DULL computer!\r"
+#BYTES_TO_SEND = b"ALL wiznet AND NO pico MAKES\rcoco A DULL computer!\r"
+BYTES_TO_SEND = b'SO RAISE YOUR JOYSTICKS, RAISE YOUR KEYBOARDS, LET CRTS ILLUMINATE THE WAY, WITH EVERY LINE, WITH EVERY BYTE, FOR COCO, WE PLEDGE ALLEGIANCE, THIS DAY!\r'
 
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,   # Shift bits into the most significant end of the shift register
@@ -101,7 +103,8 @@ def on_control_write():
     #autopull=True,                    # Automatically pull the next word from FIFO into the output shift reg
     pull_thresh=24,                   # Pull from FIFO when 24 bits of the OSR have been consumed
     out_shiftdir=rp2.PIO.SHIFT_RIGHT, # Take bits from the least significant end of the shift register
-    sideset_init=(OUT_HIGH, OUT_LOW), # 15:drive_data_bus (1 = IN to PicoW from CoCo); 16:trigger (1 = trigger oscilloscope capture)
+    sideset_init=(OUT_HIGH),          # 15:drive_data_bus (1 = IN to PicoW from CoCo)
+#   sideset_init=(OUT_HIGH, OUT_LOW), # 15:drive_data_bus (1 = IN to PicoW from CoCo); 16:trigger (1 = trigger oscilloscope capture)
 )
 def on_data_read():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
@@ -120,9 +123,11 @@ def on_data_read():
 
     out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side                                     # type: ignore
 
-    out(pins, 8).side(0b10) # trigger=1; drive_data_bus=0 (OUT to CoCo)                                              # type: ignore
+    out(pins, 8).side(0b0)  # drive_data_bus=0 (OUT to CoCo)                                              # type: ignore
+    #           .side(0b10) # trigger=1; drive_data_bus=0 (OUT to CoCo)
     wait(1, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is no longer asserted                                   # type: ignore
-    nop().side(0b01) # trigger=0; drive_data_bus=1 (IN from CoCo)                                                    # type: ignore
+    nop().side(0b1)  # drive_data_bus=1 (IN from CoCo)                                                    # type: ignore
+    #    .side(0b01) # trigger=0; drive_data_bus=1 (IN from CoCo)
 
     out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side                                      # type: ignore
 
@@ -130,6 +135,12 @@ def on_data_read():
 
 class DataProducer(): # ABC
     bytes_left: int
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
 
     def start_sending_data(self):
         raise NotImplementedError("Subclasses must implement this method")
@@ -146,7 +157,14 @@ class PIOStateMachineManager:
         self.sm_control_write = None
         self.sm_data_read = None
 
-    def set_up_state_machines(self):
+    def __enter__(self):
+        self.set_up_state_machines()
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+    def set_up_state_machines(self) -> None:
         # Remove all existing PIO programs from PIO 0
         rp2.PIO(NETIO_PIO).remove_program()
 
@@ -214,6 +232,11 @@ class PIOStateMachineManager:
         self.stop_state_machines()
         del self.sm_control_write
         del self.sm_data_read
+
+        # Remove all existing PIO programs from PIO 0
+        rp2.PIO(NETIO_PIO).remove_program()
+
+        print('PIO freed')
 
 class CPUDataProducer(DataProducer):
     def __init__(self, sm_data_read: Optional[rp2.StateMachine], bytes_to_send: bytes):
@@ -326,6 +349,8 @@ class DMADataProducer(DataProducer):
         del self.dma
         del self.tx_data_bytearray
 
+        print('DMA freed')
+
 if __name__ == "__main__":
     # allow interrupts to throw errors
     micropython.alloc_emergency_exception_buf(100)
@@ -337,36 +362,40 @@ if __name__ == "__main__":
     pins.slenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
     pins.drive_data_bus.value(1)   # 1 = IN to PicoW from CoCo
 
-    sm_mgr = PIOStateMachineManager()
+    #bytes_to_send = BYTES_TO_SEND
 
-    sm_mgr.set_up_state_machines()
+    with wifi.WifiConnectionManager() as wifi_mgr:
+        host, port = wifi.load_host_and_port_from_file()
+        data_rcvd = wifi.read_url(host, port)
+        del host; del port
 
-    # Both of these currently work, but the DMA version is more efficient
-    #data_producer = CPUDataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
-    data_producer = DMADataProducer(sm_mgr.sm_data_read, BYTES_TO_SEND)
+    print(data_rcvd.decode('ascii'))
+    bytes_to_send = data_rcvd
 
-    sm_mgr.data_producer = data_producer
-
-    sm_mgr.start_state_machines()
-
-    # Blink LED at 1 Hz
-    pins.led.value(1)
     try:
-        while True:
-            pins.led.value(1)
-            time.sleep(0.2)
-            pins.led.value(0)
-            time.sleep(0.8)
-            if data_producer.bytes_left > 0:
-                print(f'DATA REMAINING: {data_producer.bytes_left}')
-            if sm_mgr.sm_data_read and sm_mgr.sm_data_read.tx_fifo():
-                print(f'TX FIFO: {sm_mgr.sm_data_read.tx_fifo()}')
+        with PIOStateMachineManager() as sm_mgr:
+            # Both of these currently work, but the DMA version is more efficient
+            with CPUDataProducer(sm_mgr.sm_data_read, bytes_to_send) as data_producer:
+            #with DMADataProducer(sm_mgr.sm_data_read, bytes_to_send) as data_producer:
+                sm_mgr.data_producer = data_producer
+
+                sm_mgr.start_state_machines()
+
+                # Blink LED at 1 Hz
+                pins.led.value(1)
+
+                while True:
+                    pins.led.value(1)
+                    time.sleep(0.2)
+                    pins.led.value(0)
+                    time.sleep(0.8)
+                    if data_producer.bytes_left > 0:
+                        print(f'DATA REMAINING: {data_producer.bytes_left}')
+                    if sm_mgr.sm_data_read and sm_mgr.sm_data_read.tx_fifo():
+                        print(f'TX FIFO: {sm_mgr.sm_data_read.tx_fifo()}')
     finally:
-        sm_mgr.cleanup()
-        del sm_mgr
-        data_producer.cleanup()
-        del data_producer
-        print('PIO and DMA freed')
+        pins.led.value(0)
+        del pins
+
         import gc; gc.collect()
         print('gc complete')
-        pins.led.value(0)
