@@ -4,7 +4,7 @@ The CoPiCo is a cartridge for the Tandy Color Computer that adds WiFi to and
 serves as a boot ROM for the system. It is based on the Raspberry Pi Pico W
 microcontroller dev board, which includes onboard WiFi.
 
-![copico_pcb_rev0.2_front](https://github.com/thomasshanks/copico-board/blob/main/assets/copico_rev0.2_front.png)
+![copico_pcb_rev0.2_front](https://github.com/thomasshanks/copico-board/blob/main/assets/copico_rev0.2_front.png?raw=true)
 
 This proof-of-concept "firmware" runs in MicroPython on the CoPiCo. It connects
 to a predetermined TCP port and streams the next byte to the Tandy Color

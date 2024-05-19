@@ -50,7 +50,7 @@ import micropython
 import rp2
 import _thread
 
-import aardvark_v1 as board
+import copico_v2 as board
 import wifi
 
 #from abc import ABC, abstractmethod # Not supported on MicroPython
@@ -82,20 +82,26 @@ BYTES_TO_SEND = b'SO RAISE YOUR JOYSTICKS, RAISE YOUR KEYBOARDS, LET CRTS ILLUMI
 )
 def on_control_write():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
-    WRITE_CTRL_STROBE = board.WRITE_CONTROL_STROBE_PIN # GPIO strobe for Write Control (active high)
+    #WRITE_CTRL_STROBE = board.WRITE_CONTROL_STROBE_PIN # GPIO strobe for Write Control (active high)
+    CTRL_STROBE_N = 18 # board.CONTROL_STROBE_N_PIN # GPIO strobe for Control Register (active high)
     SM_IRQ = 4         # for State Machine communictaion
 
     wrap_target()                                                                                               # type: ignore
 
-    wait(1, gpio, WRITE_CTRL_STROBE) # Wait until WRITE_CTRL_STROBE is not being asserted (to prevent false positives)    # type: ignore
-    wait(0, gpio, WRITE_CTRL_STROBE) # Wait until WRITE_CTRL_STROBE is being asserted                                     # type: ignore
+    #wait(1, gpio, WRITE_CTRL_STROBE) # Wait until WRITE_CTRL_STROBE is not being asserted (to prevent false positives)  # type: ignore
+    #wait(0, gpio, WRITE_CTRL_STROBE) # Wait until WRITE_CTRL_STROBE is being asserted                                   # type: ignore
+    wait(1, gpio, CTRL_STROBE_N) # Wait until CTRL_STROBE_N is not being asserted (to prevent false positives)  # type: ignore
+    wait(0, gpio, CTRL_STROBE_N) # Wait until CTRL_STROBE_N is being asserted                                   # type: ignore
+
+    jmp(pin, "read") # If the read/~write pin is high, jump to read handling                                    # type: ignore
 
     in_(pins, 8) # Send contents of data bus to input FIFO so they can be printed on the PicoW console          # type: ignore
 
     irq(0) # Tell the CPU that we have received a Control Write strobe                                          # type: ignore
 
-    #irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes  # type: ignore
+    #irq(clear, SM_IRQ) # Tell the on_data_read state machine that it can start responding to Data Read strobes # type: ignore
 
+    label("read") # TODO: Implement control register reading                                                    # type: ignore
     wrap()                                                                                                      # type: ignore
 
 @rp2.asm_pio(
@@ -108,29 +114,38 @@ def on_control_write():
 )
 def on_data_read():
     # Constants in PIO ASM must be (re)defined inside program; globals are not accessible
-    READ_DATA_STROBE = board.READ_DATA_STROBE_PIN # GPIO strobe for Read Data (active high)
+    #READ_DATA_STROBE = board.READ_DATA_STROBE_PIN # GPIO strobe for Read Data (active high)
+    DATA_STROBE_N = 19 # board.DATA_STROBE_N_PIN # GPIO strobe for Data Register (active high)
     SM_IRQ = 4        # IRQ to wait on before responding to reads on the Data Port
 
     wrap_target()                                                                                               # type: ignore
 
     # Wait for a signal from the control port indicating that we can start responding to Data Read strobes
-    #irq(block, SM_IRQ)                                                                                          # type: ignore
+    #irq(block, SM_IRQ)                                                                                         # type: ignore
 
     pull(ifempty) # Get the next word from the FIFO and put it into the output shift register                   # type: ignore
 
-    wait(1, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is not being asserted (to prevent false positives)      # type: ignore
-    wait(0, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is being asserted                                       # type: ignore
+    #wait(1, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is not being asserted (to prevent false positives)  # type: ignore
+    #wait(0, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is being asserted                                   # type: ignore
+    wait(1, gpio, DATA_STROBE_N) # Wait until DATA_STROBE_N is not being asserted (to prevent false positives)  # type: ignore
+    wait(0, gpio, DATA_STROBE_N) # Wait until DATA_STROBE_N is being asserted                                   # type: ignore
+
+    jmp(pin, "read") # If the read/~write pin is high, jump to read handling                                    # type: ignore
+    jmp("end") # Otherwise, jump to write handling # TODO: Implement data register writing                      # type: ignore
+    label("read")                                                                                               # type: ignore
 
     out(pindirs, 8) # Set the data bus pins to be outputs on the PicoW side                                     # type: ignore
 
-    out(pins, 8).side(0b0)  # drive_data_bus=0 (OUT to CoCo)                                              # type: ignore
-    #           .side(0b10) # trigger=1; drive_data_bus=0 (OUT to CoCo)
-    wait(1, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is no longer asserted                                   # type: ignore
-    nop().side(0b1)  # drive_data_bus=1 (IN from CoCo)                                                    # type: ignore
-    #    .side(0b01) # trigger=0; drive_data_bus=1 (IN from CoCo)
+    out(pins, 8).side(0b0)  # drive_data_bus=0 (OUT to CoCo)                                                    # type: ignore
+    #            .side(0b10) # trigger=1; drive_data_bus=0 (OUT to CoCo)                                        # type: ignore
+    #wait(1, gpio, READ_DATA_STROBE) # Wait until READ_DATA_STROBE is no longer asserted                        # type: ignore
+    wait(1, gpio, DATA_STROBE_N) # Wait until DATA_STROBE_N is no longer asserted                               # type: ignore
+    nop().side(0b1)  # drive_data_bus=1 (IN from CoCo)                                                          # type: ignore
+    #    .side(0b01) # trigger=0; drive_data_bus=1 (IN from CoCo)                                               # type: ignore
 
     out(pindirs, 8) # Set the data bus pins to be inputs on the PicoW side                                      # type: ignore
 
+    label("end")                                                                                                # type: ignore
     wrap()                                                                                                      # type: ignore
 
 class DataProducer(): # ABC
@@ -173,6 +188,7 @@ class PIOStateMachineManager:
             on_control_write,
             freq=125_000_000,
             in_base=board.FIRST_DATA_PIN,
+            jmp_pin=board.READ_NOT_WRITE_PIN,
         )
 
         self.sm_data_read = rp2.StateMachine(
@@ -181,6 +197,7 @@ class PIOStateMachineManager:
             freq=125_000_000,
             out_base=board.FIRST_DATA_PIN,
             sideset_base=board.FIRST_SIDESET_PIN,
+            jmp_pin=board.READ_NOT_WRITE_PIN,
         )
 
         def handler(sm):
@@ -358,8 +375,8 @@ if __name__ == "__main__":
     pins = board.BoardPins()
 
     pins.led.value(0)   # LED off
-    pins.halt.value(0)  # 0 = Don't HALT; run CoCo
-    pins.slenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
+    #pins.halt.value(0)  # 0 = Don't HALT; run CoCo
+    #pins.slenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
     pins.drive_data_bus.value(1)   # 1 = IN to PicoW from CoCo
 
     #bytes_to_send = BYTES_TO_SEND

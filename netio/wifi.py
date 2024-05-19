@@ -105,7 +105,7 @@ def read_url(host: str, port: int) -> bytearray:
         with SocketWithContextManager() as sock:
             sock.connect(addr_tuple)
             del addr_tuple
-            sock.send(b'\n')
+            sock.send(b'30                                                             ')
             sock.settimeout(2)
             bytes_rcvd = sock.readinto(buf)
             print(f'Recevied {bytes_rcvd} bytes; disconnecting')
@@ -114,6 +114,9 @@ def read_url(host: str, port: int) -> bytearray:
     return buf
 
 if __name__ == '__main__':
+    # allow interrupts to throw errors
+    micropython.alloc_emergency_exception_buf(100)
+
     with WifiConnectionManager() as wifi_mgr:
         host, port = load_host_and_port_from_file()
         data_rcvd = read_url(host, port)
