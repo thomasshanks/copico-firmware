@@ -63,6 +63,8 @@ import _thread
 
 import copico_v2 as board
 import wifi
+import uasyncio
+
 
 #from abc import ABC, abstractmethod # Not supported on MicroPython
 
@@ -316,6 +318,18 @@ class PIOStateMachineManager:
 
         print('PIO freed')
 
+async def blink(led):
+    while True:
+        led.on()
+        await uasyncio.sleep_ms(1000)
+        led.off()
+        await uasyncio.sleep_ms(1000)
+
+async def blinker(led):
+    uasyncio.create_task(blink(led))
+    r, w = uasyncio.open_connection("10.23.23.23", 2321)
+    await uasyncio.sleep_ms(20_000)
+
 if __name__ == "__main__":
     # allow interrupts to throw errors
     micropython.alloc_emergency_exception_buf(200)
@@ -330,6 +344,8 @@ if __name__ == "__main__":
     try:
         with PIOStateMachineManager() as sm_mgr:
                 sm_mgr.start_state_machines()
+
+                uasyncio.run(blinker(pins.led))
 
                 # Blink LED at 1 Hz
                 pins.led.value(1)
