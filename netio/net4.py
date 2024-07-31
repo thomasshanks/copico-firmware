@@ -11,18 +11,7 @@
 #
 # --------------------- CoPiCo Proof of Concept Firmware --------------------
 #
-# net4 is a lowlevel test of a lowlevel protocol
-# synchronizing one tx stream and one rx stream
-# of bytes between Coco bus and Pi Pico, using
-# all four netio ports and all four state machines
-# in PIO instance 0.
-#
-# it is slow because this is Python, and a Python interrupt
-# handler gets invoked for every data byte.
-#
-# ----------------------------------------------------------------------------
-#
-# This program is a proof of concept for the CoPiCo project.
+# Use the same four I/O ports and the "sock" object from wifi.
 #
 # There are four netio ports (R/W from Coco point of view):
 #   net1 = ControlPort (write only)
@@ -30,43 +19,28 @@
 #   net3 = TxPort (read only)
 #   net4 = RxPort (write only)
 #
-# At the high level, the Coco can write one data byte (the CoPiCo will Rx)
-# or read one data byte (the Pico will Tx).  
-# In this file, we will use the names Rx and Tx from the point
-# of view of the Pi Pico, which is the opposite of the Coco's point of view.
-# That is because the Pi Pico documentation uses the Pico point of view.
-# Read and Write are terms from the Coco's CPU's point of view.
-
-# For the Coco to write one data byte for the Pico to Receive,
-# the coco should
-#   Write data byte to RxPort
-#   Write 1 to ControlPort
-#   Read from StatusPort until nonzero.
-
-# For the Coco to read one data byte that the pico Transmits,
-# the coco should
-#   Write 2 to ControlPort
-#   Read from StatusPort until nonzero.
-#   Read data byte from TxPort
-
-# That way, even though slow MicroPython code will get invoked to do each
-# operation, the Coco stays synchronized with the Pico python program.
-
-#from __future__ import annotations # Not supported on MicroPython
-
-#import atexit # Not supported on MicroPython
-import time
-
-import micropython
-import rp2
-import _thread
+# For Coco to write N bytes to the picow (and out to the TCP
+# server) (where 1 <= N <= 100):
+#   Poke N to ControlPort
+#   Peek StatusPort until it is nonzero
+#   Poke the N bytes to RxPort, but wait on StatusPort first
+#
+# For Coco to read N bytes from the pico (that came from the
+# TCP server) (where 1 <= N <= 100):
+#   Poke (100+N) to ControlPort
+#   Peek StatusPort until it is nonzero
+#   Peek the N bytes from TxPort, and wait on StatusPort after
+#
+# This could use DMA (TODO!) and could use Interrupts,
+# but right now it is just mainline code (so there is a
+# bit of a race to copy the N bytes to/from the FIFO).
 
 import copico_v2 as board
+import micropython
+import network
+import rp2
+import time
 import wifi
-import uasyncio
-
-
-#from abc import ABC, abstractmethod # Not supported on MicroPython
 
 # A special constant that is assumed to be True by 3rd party static type checkers. It is False at runtime.
 TYPE_CHECKING = False
@@ -115,7 +89,7 @@ def on_control_write():
     wait(1, gpio, CTRL_STROBE_N) # Wait until CTRL_STROBE_N rises, at end of cycle.
 
     in_(pins, 8) # Send contents of data bus to Control FIFO.
-    irq(0) # Tell the CPU that we have received a Control Write strobe                                          # type: ignore
+    #NOPE# irq(0) # Tell the CPU that we have received a Control Write strobe                                          # type: ignore
 
     wrap()                                                                                                      # type: ignore
 
@@ -254,30 +228,6 @@ class PIOStateMachineManager:
         self.sm_status_read.put(WrapTxByteWithPindirs(0))
         self.sm_tx_read.put(WrapTxByteWithPindirs(0))
 
-        def handler(sm):
-            if not self.sm_control_write:
-                raise ValueError("Control Write State Machine has not been set up")
-
-            control_byte = self.sm_control_write.get()
-            print(f'Control Byte Received: {hex(control_byte)}')
-            if control_byte == 1:  # Rx
-                # the data byte x must already be on the rx fifo.
-                fifo = self.sm_rx_write.rx_fifo()
-                x = self.sm_rx_write.get()
-                print("rx: %d  fifo=%d" % (x, fifo))
-                self.sm_status_read.put(WrapTxByteWithPindirs(x | 128))
-            elif control_byte == 2:  # Tx
-                x = NextMessageByte()
-                fifo = self.sm_tx_read.tx_fifo()
-                print("tx: %d <%s> fifo=%d" % (x, chr(x), fifo))
-                self.sm_tx_read.put(WrapTxByteWithPindirs(x))
-                self.sm_status_read.put(WrapTxByteWithPindirs(15))   # Status 15
-            else:
-                print("Undefined control byte: %d" % control_byte)
-
-        # TODO: What are the `trigger=0|1` and `hard=True|False` options on `.irq(..)` for?
-        self.sm_control_write.irq(handler=handler)
-
     def start_state_machines(self):
         if not self.sm_control_write or not self.sm_status_read:
             raise ValueError("State machines have not been set up")
@@ -318,43 +268,118 @@ class PIOStateMachineManager:
 
         print('PIO freed')
 
-async def blink(led):
-    while True:
-        led.on()
-        await uasyncio.sleep_ms(1000)
-        led.off()
-        await uasyncio.sleep_ms(1000)
+def Once(sm_mgr, sock):
+        # print("Once...")
+        # Since axiom uses 1 for TryAgain, we use 2 for Good.
 
-async def blinker(led):
-    uasyncio.create_task(blink(led))
-    r, w = uasyncio.open_connection("10.23.23.23", 2321)
-    await uasyncio.sleep_ms(20_000)
+        wrapped_good = WrapTxByteWithPindirs(2)
+
+        if not sm_mgr.sm_control_write:
+            raise ValueError("Control Write State Machine has not been set up")
+
+        while sm_mgr.sm_control_write.rx_fifo() == 0:
+            pass
+
+        control_byte = sm_mgr.sm_control_write.get()
+        print(f'Control Byte Received: {control_byte}')
+
+        fifo0 = 9
+        if control_byte <= 0:
+            print("Undefined zero control byte: %d" % control_byte)
+        elif control_byte <= 100:  # Rx
+            n = control_byte
+            a = bytearray(n)
+            sm_mgr.sm_status_read.put(wrapped_good)
+
+            for i in range(n):
+                x = sm_mgr.sm_rx_write.get()
+                sm_mgr.sm_status_read.put(wrapped_good)  # Allow coco to continue
+                if i<10: print("rx[%d]: %d  fifo=%d" % (i, x, fifo0))
+                a[i] = x
+
+            #:# for i in range(n):
+            #:#     print("RX [%d] %d" % (i, a[i]))
+
+            sock.send(bytes(a))
+
+        elif control_byte <= 200:  # Tx
+            n = control_byte - 100
+
+            try:
+                a = bytearray(0)
+                alen = len(a)
+                while alen < n:
+                    v = sock.recv(n - alen)
+                    ### print('got %d bytes from sock.recv' % len(v))
+                    a += v
+                    alen = len(a)
+            except:
+                 sm_mgr.sm_status_read.put(WrapTxByteWithPindirs(211)) # os9 E$EOF = 211 = $D3
+                 raise
+
+            #print('sock.recv returns %s' % a)
+            if a is None:
+                 sm_mgr.sm_status_read.put(WrapTxByteWithPindirs(211)) # os9 E$EOF = 211 = $D3
+                 raise Execption('sock.recv returned None, wanted %d bytes' % n)
+            print('sock.recv returns len %s', len(a))
+
+            #:# for i in range(n):
+            #:#     print("TX [%d] %d" % (i, a[i]))
+
+            sm_mgr.sm_status_read.put(wrapped_good)
+
+            for i in range(n):
+                x = a[i]
+                #fifo# while True:
+                #fifo#     # TODO -- combine in/out fifos
+                #fifo#     fifo = sm_mgr.sm_tx_read.tx_fifo()
+                #fifo#     if fifo < 4: break
+                sm_mgr.sm_tx_read.put(WrapTxByteWithPindirs(x))
+                if i<10: print("tx[%d]: %d  fifo=%d" % (i, x, fifo0))
+                sm_mgr.sm_status_read.put(wrapped_good)   # Allow coco to read it.
+
+        else:
+            print("Undefined control byte: %d" % control_byte)
+
 
 if __name__ == "__main__":
     # allow interrupts to throw errors
     micropython.alloc_emergency_exception_buf(200)
 
+    print('Define Board Pins')
     pins = board.BoardPins()
 
-    pins.led.value(0)   # LED off
+    pins.led.value(1)   # LED on
     #pins.halt.value(0)  # 0 = Don't HALT; run CoCo
     #pins.slenb.value(0) # 0 = Don't assert SLENB; CoCo device select works normally
     pins.drive_data_bus.value(1)   # 1 = IN to PicoW from CoCo
 
     try:
-        with PIOStateMachineManager() as sm_mgr:
-                sm_mgr.start_state_machines()
+        print('==> Create Wifi Manager')
+        with wifi.WifiConnectionManager() as wifi_mgr:
 
-                uasyncio.run(blinker(pins.led))
+            with wifi.SocketWithContextManager() as sock:
+                host, port = 'pizga.net', 2327
+                host, port = '192.168.86.235', 2321
+                addr_tuple = wifi.get_address_tuple(host, port)
 
-                # Blink LED at 1 Hz
-                pins.led.value(1)
+                print(f'Connecting to {addr_tuple}')
+                sock.connect(addr_tuple)
+                del addr_tuple
 
-                while True:
-                    pins.led.value(1)
-                    time.sleep(0.2)
-                    pins.led.value(0)
-                    time.sleep(0.8)
+                print('==> Create PIO Manager')
+
+                with PIOStateMachineManager() as sm_mgr:
+                    print('==> Starting State Machines')
+                    sm_mgr.start_state_machines()
+
+                    print('==> Calling Main')
+                    #lit = 0
+                    while True:
+                        #lit = 1-lit
+                        # pins.led.value(lit)
+                        Once(sm_mgr, sock)
+
 
     finally:
         pins.led.value(0)
