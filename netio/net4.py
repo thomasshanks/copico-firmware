@@ -281,7 +281,7 @@ def Once(sm_mgr, sock):
             pass
 
         control_byte = sm_mgr.sm_control_write.get()
-        print(f'Control Byte Received: {control_byte}')
+        #:# print(f'Control Byte Received: {control_byte}')
 
         fifo0 = 9
         if control_byte <= 0:
@@ -294,7 +294,7 @@ def Once(sm_mgr, sock):
             for i in range(n):
                 x = sm_mgr.sm_rx_write.get()
                 sm_mgr.sm_status_read.put(wrapped_good)  # Allow coco to continue
-                if i<10: print("rx[%d]: %d  fifo=%d" % (i, x, fifo0))
+                #:# if i<10: print("rx[%d]: %d  fifo=%d" % (i, x, fifo0))
                 a[i] = x
 
             #:# for i in range(n):
@@ -321,7 +321,7 @@ def Once(sm_mgr, sock):
             if a is None:
                  sm_mgr.sm_status_read.put(WrapTxByteWithPindirs(211)) # os9 E$EOF = 211 = $D3
                  raise Execption('sock.recv returned None, wanted %d bytes' % n)
-            print('sock.recv returns len %s', len(a))
+            #:# print('sock.recv returns len %s', len(a))
 
             #:# for i in range(n):
             #:#     print("TX [%d] %d" % (i, a[i]))
@@ -335,7 +335,7 @@ def Once(sm_mgr, sock):
                 #fifo#     fifo = sm_mgr.sm_tx_read.tx_fifo()
                 #fifo#     if fifo < 4: break
                 sm_mgr.sm_tx_read.put(WrapTxByteWithPindirs(x))
-                if i<10: print("tx[%d]: %d  fifo=%d" % (i, x, fifo0))
+                #:# if i<10: print("tx[%d]: %d  fifo=%d" % (i, x, fifo0))
                 sm_mgr.sm_status_read.put(wrapped_good)   # Allow coco to read it.
 
         else:
@@ -374,10 +374,7 @@ if __name__ == "__main__":
                     sm_mgr.start_state_machines()
 
                     print('==> Calling Main')
-                    #lit = 0
                     while True:
-                        #lit = 1-lit
-                        # pins.led.value(lit)
                         Once(sm_mgr, sock)
 
 
